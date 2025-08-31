@@ -1,0 +1,20 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Data & big files
+*.csv
+data/
+*.parquet
+*.zip
+*.gz
+
+# Notebooks & checkpoints
+*.ipynb
+.ipynb_checkpoints/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+
