@@ -1,4 +1,9 @@
 import os, io, base64, zipfile
+
+# Force headless-friendly Matplotlib backend before importing pyplot
+import matplotlib
+matplotlib.use("Agg")
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -20,7 +25,7 @@ page = st.sidebar.radio("Go to", pages)
 # =========================
 # Data loading
 # - Upload CSV/ZIP, local path, or remote URL (CSV/ZIP)
-# - Auto-detects separators: , ; \t |
+# - Auto-detect separators: , ; \t |
 # =========================
 def _read_csv_try_seps_from_bytes(buf_bytes):
     seps = [",", ";", "\t", "|"]
@@ -29,6 +34,7 @@ def _read_csv_try_seps_from_bytes(buf_bytes):
         try:
             bio.seek(0)
             df = pd.read_csv(bio, sep=s)
+            # if everything collapsed into 1 col, try next sep
             if df.shape[1] == 1 and s != seps[-1]:
                 continue
             return df
@@ -47,8 +53,9 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
             try:
                 with zipfile.ZipFile(io.BytesIO(raw)) as zf:
                     csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                    if not csvs: return pd.DataFrame()
-                    data = zf.read(csvs[0])
+                    if not csvs: 
+                        return pd.DataFrame()
+                    data = zf.read(csvs[0])  # first CSV within the zip
                     return _read_csv_try_seps_from_bytes(data)
             except Exception:
                 return pd.DataFrame()
@@ -57,19 +64,20 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
     # 2) Remote URL (CSV or ZIP)
     if url:
         try:
-            url_l = url.lower()
             r = requests.get(url, timeout=60)
             r.raise_for_status()
             raw = r.content
+            url_l = url.lower()
             if url_l.endswith(".csv"):
                 return _read_csv_try_seps_from_bytes(raw)
             if url_l.endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(raw)) as zf:
                     csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                    if not csvs: return pd.DataFrame()
+                    if not csvs:
+                        return pd.DataFrame()
                     data = zf.read(csvs[0])
                     return _read_csv_try_seps_from_bytes(data)
-            # If file type unclear, try CSV parsing anyway
+            # If file type unclear, try CSV anyway
             return _read_csv_try_seps_from_bytes(raw)
         except Exception:
             return pd.DataFrame()
@@ -84,10 +92,11 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
             if pl.endswith(".zip"):
                 with zipfile.ZipFile(path) as zf:
                     csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                    if not csvs: return pd.DataFrame()
+                    if not csvs: 
+                        return pd.DataFrame()
                     data = zf.read(csvs[0])
                     return _read_csv_try_seps_from_bytes(data)
-            # Fallback (let pandas guess)
+            # Fallback: let pandas guess
             return pd.read_csv(path)
         except Exception:
             return pd.DataFrame()
@@ -103,7 +112,7 @@ uploaded_csv = st.sidebar.file_uploader("Upload CSV or ZIP (≤200 MB)", type=["
 custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (local runs)", value="")
 remote_url  = st.sidebar.text_input("…or enter a remote URL (CSV/ZIP)", value="")
 
-# Optional: reuse a data_path variable from a local module if present (safe if it exists locally)
+# Optional: reuse a data_path if a local module defines it (ignored on Cloud if missing)
 try:
     import importlib
     project_mod = importlib.import_module("project_sl")
@@ -118,7 +127,7 @@ df_raw = load_data(uploaded_csv, custom_path, remote_url)
 if not df_raw.empty and df_raw.shape[1] == 1:
     st.sidebar.warning(
         "Data loaded as a single column. The parser tries ',', ';', tab, and '|'. "
-        "If columns still look wrong, consider a different source or ZIP."
+        "If columns still look wrong, consider using a different source or ZIP."
     )
 
 # =========================
@@ -264,6 +273,7 @@ if page == pages[0] and not df.empty:
 if page == pages[1] and not df.empty:
     st.write("### DataVizualization")
 
+    # Optional energy conversion: half-hourly MW → MWh (×0.5) for energy totals
     convert_to_mwh = st.checkbox("Convert MW (half-hourly) to MWh (×0.5) for energy totals", value=False)
     if convert_to_mwh:
         df_plot = df.copy()
@@ -275,12 +285,14 @@ if page == pages[1] and not df.empty:
         df_plot = df.copy()
         unit_note = ""
 
+    # Region filter
     if 'Region' in df_plot.columns:
         regions = sorted([str(x) for x in df_plot['Region'].dropna().unique()])
         chosen_regions = st.multiselect("Filter by region", options=regions, default=regions[:1] if regions else [])
         if chosen_regions:
             df_plot = df_plot[df_plot['Region'].astype(str).isin(chosen_regions)]
 
+    # Ensure calendar fields
     if 'Date-Time' in df_plot.columns:
         if 'Month' not in df_plot.columns:
             df_plot['Month'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.month
@@ -301,8 +313,9 @@ if page == pages[1] and not df.empty:
         "Grid balance & mix"
     ])
 
+    # --- General plots ---
     with tab1:
-        cat_cols = [c for c in df_plot.columns if df_plot[c].dtype == 'object' or df_plot[c].dtype.name == 'category']
+        cat_cols = [c for c in df_plot.columns if df_plot[c].dtype == 'object' or getattr(df_plot[c].dtype, "name", "") == 'category']
         if cat_cols:
             chosen_cat = st.selectbox("Countplot — choose a categorical column", options=cat_cols, key="cat1")
             fig = plt.figure()
@@ -332,6 +345,7 @@ if page == pages[1] and not df.empty:
             st.pyplot(fig3)
             st.caption("Shows daily, weekly, and seasonal structure in the series.")
 
+    # --- Monthly seasonality ---
     with tab2:
         st.write("#### Monthly seasonality (averages by month)")
         if 'Month' in df_plot.columns:
@@ -377,6 +391,7 @@ if page == pages[1] and not df.empty:
             st.pyplot(fig_mix)
             st.caption("Nuclear provides stable low-CO₂ base; wind/solar vary; hydro adds flexibility.")
 
+    # --- Weekly / Hourly by Region ---
     with tab3:
         st.write("#### Weekly and Hourly demand profiles")
         if {'Weekday','Hour'}.issubset(df_plot.columns):
@@ -424,6 +439,7 @@ if page == pages[1] and not df.empty:
         else:
             st.info("Weekday/Hour not available. Ensure 'Date-Time' exists and is parsed.")
 
+    # --- Grid balance & mix ---
     with tab4:
         if {'Year'}.issubset(df_plot.columns) and all(c in df_plot.columns for c in MAIN_SOURCES) and 'Consumption' in df_plot.columns:
             st.write("**Yearly Energy Production (by source) vs Consumption (TWh)**")
@@ -461,7 +477,7 @@ if page == pages[1] and not df.empty:
                 fig_pie = go.Figure(go.Pie(labels=mix_series.index, values=mix_series.values, hole=0.35))
                 fig_pie.update_layout(template='plotly_white', height=420)
                 st.plotly_chart(fig_pie, use_container_width=True)
-                st.caption("Low-CO₂ = Nuclear + Renewables (Wind, Solar, Hydraulic, Biomass).")
+            st.caption("Low-CO₂ = Nuclear + Renewables (Wind, Solar, Hydraulic, Biomass).")
 
 # =========================
 # Page 3 — Modelling
