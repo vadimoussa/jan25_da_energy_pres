@@ -1,5 +1,7 @@
 import os
+import io
 import base64
+import zipfile
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -20,28 +22,79 @@ page = st.sidebar.radio("Go to", pages)
 # =========================
 # Data loading
 # Supports: upload OR local path
-# Auto-detects common separators
+# Auto-detects common separators; reads CSV or ZIP (with one CSV inside)
 # =========================
 def _read_csv_smart(uploaded_file=None, path=None):
     seps = [",", ";", "\t", "|"]
-    if uploaded_file is not None:
-        buf = uploaded_file.getvalue()
+
+    def read_csv_try_seps(file_like):
+        # try multiple separators; reset pointer if possible between tries
         for s in seps:
             try:
-                return pd.read_csv(pd.io.common.BytesIO(buf), sep=s)
+                return pd.read_csv(file_like, sep=s)
             except Exception:
-                continue
+                try:
+                    file_like.seek(0)
+                except Exception:
+                    pass
         return pd.DataFrame()
-    if path and os.path.exists(path):
-        best_df, best_cols = None, -1
-        for s in seps:
+
+    # ---------- Uploaded file (CSV or ZIP) ----------
+    if uploaded_file is not None:
+        name = uploaded_file.name.lower()
+        raw = uploaded_file.read()
+        bio = io.BytesIO(raw)
+
+        # Plain CSV
+        if name.endswith(".csv"):
+            return read_csv_try_seps(io.BytesIO(raw))
+
+        # ZIP with a CSV inside
+        if name.endswith(".zip"):
             try:
-                df = pd.read_csv(path, sep=s)
-                if df.shape[1] > best_cols:
-                    best_cols = df.shape[1]; best_df = df
-            except Exception:
-                continue
-        return best_df if best_df is not None else pd.DataFrame()
+                with zipfile.ZipFile(bio) as zf:
+                    csv_members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                    if not csv_members:
+                        return pd.DataFrame()
+                    with zf.open(csv_members[0], "r") as f:
+                        # try direct read; if it fails, buffer then try seps
+                        try:
+                            return pd.read_csv(f)
+                        except Exception:
+                            data = f.read()
+                            return read_csv_try_seps(io.BytesIO(data))
+            except zipfile.BadZipFile:
+                return pd.DataFrame()
+        return pd.DataFrame()
+
+    # ---------- Local filesystem path (works when running locally) ----------
+    if path and os.path.exists(path):
+        pl = path.lower()
+
+        if pl.endswith(".csv"):
+            with open(path, "rb") as f:
+                return read_csv_try_seps(io.BytesIO(f.read()))
+
+        if pl.endswith(".zip"):
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    csv_members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                    if not csv_members:
+                        return pd.DataFrame()
+                    with zf.open(csv_members[0], "r") as f:
+                        try:
+                            return pd.read_csv(f)
+                        except Exception:
+                            data = f.read()
+                            return read_csv_try_seps(io.BytesIO(data))
+            except zipfile.BadZipFile:
+                return pd.DataFrame()
+
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return pd.DataFrame()
+
     return pd.DataFrame()
 
 @st.cache_data
@@ -49,8 +102,8 @@ def load_data(uploaded_file=None, path=None):
     return _read_csv_smart(uploaded_file, path)
 
 st.sidebar.subheader("Data source")
-uploaded_csv = st.sidebar.file_uploader("Upload CSV (≤200 MB)", type=["csv"])
-custom_path = st.sidebar.text_input("…or enter a local CSV path (no size limit)", value="")
+uploaded_csv = st.sidebar.file_uploader("Upload CSV/ZIP (≤200 MB)", type=["csv", "zip"])
+custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (no size limit when running locally)", value="")
 
 # Optional: reuse a data_path variable from a local module if present
 try:
@@ -157,7 +210,7 @@ def preprocess(df):
 df = preprocess(df_raw)
 
 if df.empty:
-    st.info("No data loaded yet. Upload a CSV or enter a valid path in the sidebar.")
+    st.info("No data loaded yet. Upload a CSV/ZIP or enter a valid local path (local paths work when running the app on your machine).")
 else:
     with st.sidebar.expander("Columns detected", expanded=False):
         st.write(list(df.columns))
