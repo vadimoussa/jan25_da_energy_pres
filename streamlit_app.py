@@ -1,7 +1,4 @@
 import os, io, base64, zipfile
-import matplotlib
-matplotlib.use("Agg")  # safe backend for headless servers
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,7 +6,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.graph_objects as go
 import plotly.express as px
-from pandas.api.types import is_numeric_dtype
+import requests
+from pandas.api.types import is_numeric_dtype  # robust numeric checker (handles Period, etc.)
 
 # =========================
 # App title & navigation
@@ -20,55 +18,76 @@ pages = ["Exploration", "DataVizualization", "Modelling", "Report (PDF)"]
 page = st.sidebar.radio("Go to", pages)
 
 # =========================
-# Data loading — CSV or ZIP, auto-separator (comma/semicolon/tab/pipe)
+# Data loading
+# - Upload CSV/ZIP, local path, or remote URL (CSV/ZIP)
+# - Auto-detects separators: , ; \t |
 # =========================
-def _read_csv_smart(uploaded_file=None, path=None):
+def _read_csv_try_seps_from_bytes(buf_bytes):
     seps = [",", ";", "\t", "|"]
+    bio = io.BytesIO(buf_bytes)
+    for s in seps:
+        try:
+            bio.seek(0)
+            df = pd.read_csv(bio, sep=s)
+            if df.shape[1] == 1 and s != seps[-1]:
+                continue
+            return df
+        except Exception:
+            pass
+    return pd.DataFrame()
 
-    def read_csv_try_seps(buf_bytes):
-        bio = io.BytesIO(buf_bytes)
-        for s in seps:
-            try:
-                bio.seek(0)
-                df = pd.read_csv(bio, sep=s)
-                # avoid "everything in one column"
-                if df.shape[1] == 1 and s != seps[-1]:
-                    continue
-                return df
-            except Exception:
-                pass
-        return pd.DataFrame()
-
-    # Uploaded
+def _read_csv_smart(uploaded_file=None, path=None, url=None):
+    # 1) Uploaded file (CSV or ZIP)
     if uploaded_file is not None:
         name = (uploaded_file.name or "").lower()
         raw = uploaded_file.read() or b""
         if name.endswith(".csv"):
-            return read_csv_try_seps(raw)
+            return _read_csv_try_seps_from_bytes(raw)
         if name.endswith(".zip"):
             try:
                 with zipfile.ZipFile(io.BytesIO(raw)) as zf:
                     csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                     if not csvs: return pd.DataFrame()
                     data = zf.read(csvs[0])
-                    return read_csv_try_seps(data)
+                    return _read_csv_try_seps_from_bytes(data)
             except Exception:
                 return pd.DataFrame()
         return pd.DataFrame()
 
-    # Local path (only when running locally)
-    if path and os.path.exists(path):
-        pl = path.lower()
+    # 2) Remote URL (CSV or ZIP)
+    if url:
         try:
+            url_l = url.lower()
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            raw = r.content
+            if url_l.endswith(".csv"):
+                return _read_csv_try_seps_from_bytes(raw)
+            if url_l.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                    if not csvs: return pd.DataFrame()
+                    data = zf.read(csvs[0])
+                    return _read_csv_try_seps_from_bytes(data)
+            # If file type unclear, try CSV parsing anyway
+            return _read_csv_try_seps_from_bytes(raw)
+        except Exception:
+            return pd.DataFrame()
+
+    # 3) Local path (CSV or ZIP)
+    if path and os.path.exists(path):
+        try:
+            pl = path.lower()
             if pl.endswith(".csv"):
                 with open(path, "rb") as f:
-                    return read_csv_try_seps(f.read())
+                    return _read_csv_try_seps_from_bytes(f.read())
             if pl.endswith(".zip"):
                 with zipfile.ZipFile(path) as zf:
                     csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                     if not csvs: return pd.DataFrame()
                     data = zf.read(csvs[0])
-                    return read_csv_try_seps(data)
+                    return _read_csv_try_seps_from_bytes(data)
+            # Fallback (let pandas guess)
             return pd.read_csv(path)
         except Exception:
             return pd.DataFrame()
@@ -76,23 +95,36 @@ def _read_csv_smart(uploaded_file=None, path=None):
     return pd.DataFrame()
 
 @st.cache_data
-def load_data(uploaded_file=None, path=None):
-    return _read_csv_smart(uploaded_file, path)
+def load_data(uploaded_file=None, path=None, url=None):
+    return _read_csv_smart(uploaded_file, path, url)
 
 st.sidebar.subheader("Data source")
-uploaded_csv = st.sidebar.file_uploader("Upload CSV/ZIP (≤200 MB)", type=["csv", "zip"])
-custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (works only when running locally)", value="")
+uploaded_csv = st.sidebar.file_uploader("Upload CSV or ZIP (≤200 MB)", type=["csv", "zip"])
+custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (local runs)", value="")
+remote_url  = st.sidebar.text_input("…or enter a remote URL (CSV/ZIP)", value="")
 
-df_raw = load_data(uploaded_csv, custom_path)
+# Optional: reuse a data_path variable from a local module if present (safe if it exists locally)
+try:
+    import importlib
+    project_mod = importlib.import_module("project_sl")
+    default_path = getattr(project_mod, "data_path", "")
+    if (not uploaded_csv) and (not custom_path) and (not remote_url) and default_path:
+        custom_path = default_path
+except Exception:
+    pass
+
+df_raw = load_data(uploaded_csv, custom_path, remote_url)
 
 if not df_raw.empty and df_raw.shape[1] == 1:
     st.sidebar.warning(
         "Data loaded as a single column. The parser tries ',', ';', tab, and '|'. "
-        "If columns still look wrong, please re-upload the CSV/ZIP."
+        "If columns still look wrong, consider a different source or ZIP."
     )
 
 # =========================
 # Data preparation
+# Harmonize column names, filter definitive data, parse datetime,
+# calendar features, production totals, balances, etc.
 # =========================
 RENAME_FR_EN = {
     'Code INSEE région': 'INSEE_region_code',
@@ -129,34 +161,24 @@ def _drop_all_zero_cols(d, names=('Battery_storage','Battery_destock','Wind_onsh
 
 def preprocess(df):
     if df.empty:
-        return df.copy()
-    df = df.copy().rename(RENAME_FR_EN, axis=1)
+        return df
+    df = df.rename(RENAME_FR_EN, axis=1)
 
-    # Keep definitive data if present
     if 'Nature' in df.columns:
-        try:
-            m = df['Nature'].astype(str).str.contains("Données définitives|Definitive data", case=False, regex=True)
-            if m.any():
-                df = df[m].copy()
-            df['Nature'] = df['Nature'].replace('Données définitives', 'Definitive data')
-        except Exception:
-            pass
+        m = df['Nature'].astype(str).str.contains("Données définitives|Definitive data", case=False, regex=True)
+        if m.any():
+            df = df[m].copy()
+        df['Nature'] = df['Nature'].replace('Données définitives', 'Definitive data')
 
-    # Clean timezone suffix in Date-Time if present
     if 'Date-Time' in df.columns and df['Date-Time'].dtype == object:
-        try:
-            dt_str = df['Date-Time'].astype(str)
-            df['Date-Time'] = np.where(dt_str.str.match(r'.*\+\d{2}:\d{2}$'), dt_str.str[:-6], dt_str)
-        except Exception:
-            pass
+        dt_str = df['Date-Time'].astype(str)
+        df['Date-Time'] = np.where(dt_str.str.match(r'.*\+\d{2}:\d{2}$'), dt_str.str[:-6], dt_str)
 
-    # Parse dates
     if 'Date' in df.columns:
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     if 'Date-Time' in df.columns:
         df['Date-Time'] = pd.to_datetime(df['Date-Time'], errors='coerce')
 
-    # Calendar features
     if 'Date' in df.columns:
         df['Year'] = df['Date'].dt.year
         df['Month'] = df['Date'].dt.month
@@ -169,12 +191,10 @@ def preprocess(df):
             except Exception:
                 pass
 
-    # Numeric casting
     for c in MAIN_SOURCES + ['Consumption','Physical_exchanges','Pumped_storage']:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    # Production totals
     if all(c in df.columns for c in MAIN_SOURCES):
         df['ProdTotal'] = df[MAIN_SOURCES].sum(axis=1)
         if 'Physical_exchanges' in df.columns:
@@ -182,16 +202,11 @@ def preprocess(df):
         else:
             df['ProdTotal_PhyEx'] = df['ProdTotal']
 
-    # Balances and aggregates
     if 'Consumption' in df.columns and 'ProdTotal' in df.columns:
         renew_cols = [c for c in ['Wind','Solar','Hydraulic','Biomass'] if c in df.columns]
-        try:
-            df['Diff_ProdTotal'] = df['ProdTotal'] - df['Consumption']
-            df['Renewables'] = df[renew_cols].sum(axis=1) if renew_cols else np.nan
-            if 'Nuclear' in df.columns and renew_cols:
-                df['LowCO2'] = df[['Nuclear'] + renew_cols].sum(axis=1)
-        except Exception:
-            pass
+        df['Diff_ProdTotal'] = df['ProdTotal'] - df['Consumption']
+        df['Renewables'] = df[renew_cols].sum(axis=1) if renew_cols else np.nan
+        df['LowCO2'] = df[['Nuclear'] + renew_cols].sum(axis=1) if 'Nuclear' in df.columns and renew_cols else np.nan
 
     df = _drop_all_zero_cols(df)
     return df
@@ -199,7 +214,7 @@ def preprocess(df):
 df = preprocess(df_raw)
 
 if df.empty:
-    st.info("No data loaded yet. Upload a CSV/ZIP or enter a valid local path (local paths work when running the app on your machine).")
+    st.info("No data loaded yet. Upload a CSV/ZIP, paste a Remote URL (CSV/ZIP), or enter a valid local path.")
 else:
     with st.sidebar.expander("Columns detected", expanded=False):
         st.write(list(df.columns))
@@ -279,13 +294,15 @@ if page == pages[1] and not df.empty:
 
     numeric_cols = numeric_columns(df_plot)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["General plots","Monthly seasonality","Weekly / Hourly by Region","Grid balance & mix"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "General plots",
+        "Monthly seasonality",
+        "Weekly / Hourly by Region",
+        "Grid balance & mix"
+    ])
 
-    # --- General plots ---
     with tab1:
-        # safer, simple categorical detection
-        cat_cols = [c for c in df_plot.columns
-                    if (str(df_plot[c].dtype) == "object") or (getattr(df_plot[c].dtype, "name", "") == "category")]
+        cat_cols = [c for c in df_plot.columns if df_plot[c].dtype == 'object' or df_plot[c].dtype.name == 'category']
         if cat_cols:
             chosen_cat = st.selectbox("Countplot — choose a categorical column", options=cat_cols, key="cat1")
             fig = plt.figure()
@@ -315,7 +332,6 @@ if page == pages[1] and not df.empty:
             st.pyplot(fig3)
             st.caption("Shows daily, weekly, and seasonal structure in the series.")
 
-    # --- Monthly seasonality ---
     with tab2:
         st.write("#### Monthly seasonality (averages by month)")
         if 'Month' in df_plot.columns:
@@ -361,7 +377,6 @@ if page == pages[1] and not df.empty:
             st.pyplot(fig_mix)
             st.caption("Nuclear provides stable low-CO₂ base; wind/solar vary; hydro adds flexibility.")
 
-    # --- Weekly / Hourly by Region ---
     with tab3:
         st.write("#### Weekly and Hourly demand profiles")
         if {'Weekday','Hour'}.issubset(df_plot.columns):
@@ -377,9 +392,7 @@ if page == pages[1] and not df.empty:
 
                 if 'Region' in df_plot.columns:
                     region_for_profile = st.selectbox(
-                        "Region (optional)",
-                        options=["<All>"] + sorted(df_plot['Region'].astype(str).unique().tolist()),
-                        index=0
+                        "Region (optional)", options=["<All>"] + sorted(df_plot['Region'].astype(str).unique().tolist()), index=0
                     )
                     dprof = df_plot if region_for_profile == "<All>" else df_plot[df_plot['Region'].astype(str) == region_for_profile]
                 else:
@@ -411,7 +424,6 @@ if page == pages[1] and not df.empty:
         else:
             st.info("Weekday/Hour not available. Ensure 'Date-Time' exists and is parsed.")
 
-    # --- Grid balance & mix ---
     with tab4:
         if {'Year'}.issubset(df_plot.columns) and all(c in df_plot.columns for c in MAIN_SOURCES) and 'Consumption' in df_plot.columns:
             st.write("**Yearly Energy Production (by source) vs Consumption (TWh)**")
