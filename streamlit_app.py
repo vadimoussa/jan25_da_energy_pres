@@ -1,4 +1,4 @@
-import os, io, base64, zipfile
+import os, io, base64, zipfile, re
 
 # Headless-safe Matplotlib backend (required on Streamlit Cloud)
 import matplotlib
@@ -23,7 +23,7 @@ pages = ["Exploration", "DataVizualization", "Modelling", "Report (PDF)"]
 page = st.sidebar.radio("Go to", pages)
 
 # =========================
-# Data loading utils
+# Data loading helpers
 # =========================
 SEPARATORS = [",", ";", "\t", "|"]
 
@@ -34,7 +34,7 @@ def _try_read_csv(bio_or_path, sep):
             sep=sep,
             low_memory=False,
             on_bad_lines="skip",
-            engine="python"  # robust with odd quoting
+            engine="python"
         )
     except Exception:
         return None
@@ -47,20 +47,80 @@ def _read_csv_try_seps_from_bytes(buf_bytes):
         df = _try_read_csv(bio, s)
         if df is None:
             continue
-        # prefer a parse that yields >1 column
         if best is None or df.shape[1] > best.shape[1]:
             best = df
         if df.shape[1] >= 5:
             break
     return best if best is not None else pd.DataFrame()
 
+def _normalize_url(url: str) -> str:
+    u = url.strip()
+    # Dropbox: convert sharing page → direct file
+    if "dropbox.com" in u and "dl.dropboxusercontent.com" not in u:
+        u = u.replace("www.dropbox.com", "dl.dropboxusercontent.com")
+        u = re.sub(r"\?dl=0($|&)", "?dl=1\\1", u)
+        if "dl=1" not in u:
+            u += ("&" if "?" in u else "?") + "dl=1"
+    # Google Drive: file link -> export download
+    m = re.search(r"drive.google.com/(?:file/d/|open\?id=)([^/?&]+)", u)
+    if m:
+        file_id = m.group(1)
+        u = f"https://drive.google.com/uc?export=download&id={file_id}"
+    return u
+
+def _fetch_url_bytes(url: str):
+    """
+    Returns: (ok: bool, raw: bytes|None, meta: dict)
+    meta keys: status, content_type, length, final_url, error (optional)
+    """
+    meta = {"status": None, "content_type": None, "length": None, "final_url": None, "error": None}
+    try:
+        fixed = _normalize_url(url)
+        headers = {"User-Agent": "Mozilla/5.0 (Streamlit-DataLoader)"}
+        r = requests.get(fixed, headers=headers, timeout=120, allow_redirects=True)
+        meta["status"] = r.status_code
+        meta["content_type"] = r.headers.get("content-type", "")
+        meta["length"] = r.headers.get("content-length", None)
+        meta["final_url"] = r.url
+        if r.status_code >= 400:
+            meta["error"] = f"HTTP {r.status_code}"
+            return False, None, meta
+        return True, r.content, meta
+    except Exception as e:
+        meta["error"] = str(e)
+        return False, None, meta
+
+def _parse_bytes_to_df(raw: bytes, url_hint: str = "") -> pd.DataFrame:
+    """Try ZIP first, then CSV."""
+    if not raw:
+        return pd.DataFrame()
+
+    # Try ZIP (by header or extension)
+    is_zip_ext = url_hint.lower().endswith(".zip")
+    looks_like_zip = raw.startswith(b"PK\x03\x04")
+    if is_zip_ext or looks_like_zip:
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+                if not csvs:
+                    return pd.DataFrame()
+                # pick the first CSV (you can rename so the intended one is first)
+                data = zf.read(csvs[0])
+                return _read_csv_try_seps_from_bytes(data)
+        except Exception:
+            pass  # fall through to CSV attempt
+
+    # Try CSV regardless of content-type (some hosts mislabel)
+    try:
+        return _read_csv_try_seps_from_bytes(raw)
+    except Exception:
+        return pd.DataFrame()
+
 def _read_csv_smart(uploaded_file=None, path=None, url=None):
-    # 1) Uploaded file (CSV or ZIP)
+    # 1) Uploaded file (CSV/ZIP)
     if uploaded_file is not None:
         name = (uploaded_file.name or "").lower()
         raw = uploaded_file.read() or b""
-        if name.endswith(".csv"):
-            return _read_csv_try_seps_from_bytes(raw)
         if name.endswith(".zip"):
             try:
                 with zipfile.ZipFile(io.BytesIO(raw)) as zf:
@@ -71,39 +131,21 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
                     return _read_csv_try_seps_from_bytes(data)
             except Exception:
                 return pd.DataFrame()
-        return pd.DataFrame()
+        # assume CSV otherwise
+        return _read_csv_try_seps_from_bytes(raw)
 
-    # 2) Remote URL (CSV or ZIP)
+    # 2) Remote URL (CSV/ZIP)
     if url:
-        try:
-            r = requests.get(url, timeout=90)
-            r.raise_for_status()
-            ctype = r.headers.get("content-type", "").lower()
-            if "text/html" in ctype:
-                return pd.DataFrame()
-            raw = r.content
-            url_l = url.lower()
-            if url_l.endswith(".csv"):
-                return _read_csv_try_seps_from_bytes(raw)
-            if url_l.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                    csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                    if not csvs:
-                        return pd.DataFrame()
-                    data = zf.read(csvs[0])
-                    return _read_csv_try_seps_from_bytes(data)
-            # unknown content-type: try CSV
-            return _read_csv_try_seps_from_bytes(raw)
-        except Exception:
+        ok, raw, meta = _fetch_url_bytes(url)
+        st.session_state["_last_fetch_meta"] = meta  # store for sidebar debug
+        if not ok or raw is None:
             return pd.DataFrame()
+        return _parse_bytes_to_df(raw, url_hint=meta.get("final_url") or url)
 
-    # 3) Local path (CSV or ZIP)
+    # 3) Local path (CSV/ZIP)
     if path and os.path.exists(path):
         try:
             pl = path.lower()
-            if pl.endswith(".csv"):
-                with open(path, "rb") as f:
-                    return _read_csv_try_seps_from_bytes(f.read())
             if pl.endswith(".zip"):
                 with zipfile.ZipFile(path) as zf:
                     csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
@@ -111,9 +153,8 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
                         return pd.DataFrame()
                     data = zf.read(csvs[0])
                     return _read_csv_try_seps_from_bytes(data)
-            # fallback: let pandas guess with robust options
-            df = pd.read_csv(path, low_memory=False, on_bad_lines="skip", engine="python")
-            return df
+            with open(path, "rb") as f:
+                return _read_csv_try_seps_from_bytes(f.read())
         except Exception:
             return pd.DataFrame()
 
@@ -123,13 +164,16 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
 def load_data(uploaded_file=None, path=None, url=None):
     return _read_csv_smart(uploaded_file, path, url)
 
+# =========================
+# Sidebar data source
+# =========================
 st.sidebar.subheader("Data source")
 uploaded_csv = st.sidebar.file_uploader("Upload CSV or ZIP (≤200 MB)", type=["csv", "zip"])
 custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (local runs)", value="")
 remote_url  = st.sidebar.text_input(
     "…or enter a direct remote URL (CSV/ZIP)",
     value="",
-    help="GitHub Releases must be /releases/download/<tag>/<file>.csv (or .zip). Dropbox links end with ?dl=1"
+    help="Examples: GitHub Releases direct asset, Dropbox (dl.dropboxusercontent.com), Google Drive export link."
 )
 
 # Optional: reuse a local constant if available
@@ -144,18 +188,26 @@ except Exception:
 
 df_raw = load_data(uploaded_csv, custom_path, remote_url)
 
-# User feedback if URL provided but not parsed
+# Debug panel for last fetch (only if URL used)
+if remote_url:
+    meta = st.session_state.get("_last_fetch_meta")
+    with st.sidebar.expander("Remote fetch debug", expanded=False):
+        if meta:
+            st.write({k: v for k, v in meta.items() if v is not None})
+        else:
+            st.write("No fetch attempted or cached.")
+
+# Gentle guidance if URL provided but no data parsed
 if remote_url and df_raw.empty:
     st.sidebar.error(
         "Could not load data from the provided URL. "
-        "Use a **direct file link** (it should download a .csv or .zip). "
-        "For GitHub Releases: /releases/download/<tag>/<file>.csv (or .zip)."
+        "Make sure it downloads a .csv or .zip directly (no HTML page)."
     )
 
 if not df_raw.empty and df_raw.shape[1] == 1:
     st.sidebar.warning(
         "Data loaded as a single column. The parser tried ',', ';', tab, and '|'. "
-        "If columns still look wrong, consider providing a ZIP that contains a clean CSV."
+        "If columns still look wrong, provide a ZIP containing a clean CSV."
     )
 
 # =========================
@@ -198,28 +250,25 @@ def preprocess(df):
     if df.empty:
         return df
 
-    # standardize column names (first try exact French headers)
+    # Standardize columns (French → English)
     df = df.rename(RENAME_FR_EN, axis=1)
-
-    # If columns are generic (e.g., 0,1,2…) due to bad CSV, attempt a second pass by stripping spaces
     if 'Date - Heure' in df.columns and 'Date-Time' not in df.columns:
         df = df.rename(columns={'Date - Heure': 'Date-Time'})
 
-    # Filter definitive data if present
+    # Keep definitive data if present
     if 'Nature' in df.columns:
         m = df['Nature'].astype(str).str.contains("Données définitives|Definitive data", case=False, regex=True)
         if m.any():
             df = df[m].copy()
         df['Nature'] = df['Nature'].replace('Données définitives', 'Definitive data')
 
-    # Normalize "Date-Time" even if mixed/object; strip timezone suffix if any
+    # Normalize Date-Time (remove timezone suffix if any)
     if 'Date-Time' in df.columns:
         dt_str = df['Date-Time'].astype(str)
-        # remove trailing timezone like "+02:00" if present
-        dt_str = np.where(pd.Series(dt_str).str.match(r'.*\+\d{2}:\d{2}$', na=False), pd.Series(dt_str).str[:-6], dt_str)
+        dt_str = np.where(pd.Series(dt_str).str.match(r'.*\+\d{2}:\d{2}$', na=False),
+                          pd.Series(dt_str).str[:-6], dt_str)
         df['Date-Time'] = pd.to_datetime(dt_str, errors='coerce')
 
-    # Parse "Date" if present
     if 'Date' in df.columns:
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
 
@@ -230,12 +279,11 @@ def preprocess(df):
         df['Weekday'] = df['Date'].dt.day_name()
     if 'Date-Time' in df.columns and df['Date-Time'].notna().any():
         df['Hour'] = df['Date-Time'].dt.hour
-        # Optional YearMonth; keep as string to avoid Period dtype issues downstream
+        # Use string YearMonth to avoid Period dtype issues
         if 'YearMonth' not in df.columns:
-            ym = df['Date-Time'].dt.strftime('%Y-%m')
-            df['YearMonth'] = ym
+            df['YearMonth'] = df['Date-Time'].dt.strftime('%Y-%m')
 
-    # Numeric coercion for main columns
+    # Numeric coercion
     for c in MAIN_SOURCES + ['Consumption','Physical_exchanges','Pumped_storage']:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -259,13 +307,11 @@ def preprocess(df):
 
 df = preprocess(df_raw)
 
-# If key columns missing, stop early so pages don't crash
 required_any = ['Date-Time', 'Consumption']
 if not df.empty and (not set(required_any).issubset(df.columns)):
     st.sidebar.error(
         "The dataset loaded but required columns are missing. "
-        "Expected at least 'Date-Time' and 'Consumption'. "
-        "Please verify the file separator and that you provided the correct file."
+        "Expected at least 'Date-Time' and 'Consumption'."
     )
 
 if df.empty:
@@ -320,7 +366,6 @@ if page == pages[1] and not df.empty and set(required_any).issubset(df.columns):
     st.write("### DataVizualization")
 
     try:
-        # Optional: half-hourly MW → MWh (×0.5) for energy totals
         convert_to_mwh = st.checkbox("Convert MW (half-hourly) to MWh (×0.5) for energy totals", value=False)
         if convert_to_mwh:
             df_plot = df.copy()
@@ -348,7 +393,6 @@ if page == pages[1] and not df.empty and set(required_any).issubset(df.columns):
             if 'Weekday' not in df_plot.columns:
                 df_plot['Weekday'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.day_name()
 
-        # Numeric columns (robustly)
         def numeric_columns(d):
             return [c for c in d.columns if is_numeric_dtype(d[c])]
 
@@ -528,9 +572,8 @@ if page == pages[1] and not df.empty and set(required_any).issubset(df.columns):
                     st.plotly_chart(fig_pie, use_container_width=True)
                 st.caption("Low-CO₂ = Nuclear + Renewables (Wind, Solar, Hydraulic, Biomass).")
 
-    except Exception as e:
+    except Exception:
         st.error("Visualization error. Please verify your data source and try again.")
-        # st.exception(e)  # enable if you want the traceback while debugging
 
 # =========================
 # Page 3 — Modelling
@@ -538,8 +581,7 @@ if page == pages[1] and not df.empty and set(required_any).issubset(df.columns):
 if page == pages[2] and not df.empty and set(required_any).issubset(df.columns):
     st.write("### Modelling (Consumption forecasting demo)")
 
-    model_ready = {'Date-Time','Consumption'}.issubset(df.columns)
-    if not model_ready:
+    if not {'Date-Time','Consumption'}.issubset(df.columns):
         st.warning("Required columns missing: Date-Time and Consumption.")
     else:
         model_choice = st.selectbox("Model", ["Decision Tree Regressor", "Random Forest Regressor"])
