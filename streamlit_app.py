@@ -1,6 +1,6 @@
 import os, io, base64, zipfile
 
-# Use a headless-safe Matplotlib backend before importing pyplot
+# Headless-safe Matplotlib backend (required on Streamlit Cloud)
 import matplotlib
 matplotlib.use("Agg")
 
@@ -12,7 +12,7 @@ import seaborn as sns
 import plotly.graph_objects as go
 import plotly.express as px
 import requests
-from pandas.api.types import is_numeric_dtype  # robust numeric checker (handles Period, etc.)
+from pandas.api.types import is_numeric_dtype
 
 # =========================
 # App title & navigation
@@ -23,24 +23,36 @@ pages = ["Exploration", "DataVizualization", "Modelling", "Report (PDF)"]
 page = st.sidebar.radio("Go to", pages)
 
 # =========================
-# Data loading
-# - Upload CSV/ZIP, local path, or remote URL (CSV/ZIP)
-# - Auto-detect separators: , ; \t |
+# Data loading utils
 # =========================
+SEPARATORS = [",", ";", "\t", "|"]
+
+def _try_read_csv(bio_or_path, sep):
+    try:
+        return pd.read_csv(
+            bio_or_path,
+            sep=sep,
+            low_memory=False,
+            on_bad_lines="skip",
+            engine="python"  # robust with odd quoting
+        )
+    except Exception:
+        return None
+
 def _read_csv_try_seps_from_bytes(buf_bytes):
-    seps = [",", ";", "\t", "|"]
     bio = io.BytesIO(buf_bytes)
-    for s in seps:
-        try:
-            bio.seek(0)
-            df = pd.read_csv(bio, sep=s)
-            # If it collapsed to a single column, try the next separator.
-            if df.shape[1] == 1 and s != seps[-1]:
-                continue
-            return df
-        except Exception:
-            pass
-    return pd.DataFrame()
+    best = None
+    for s in SEPARATORS:
+        bio.seek(0)
+        df = _try_read_csv(bio, s)
+        if df is None:
+            continue
+        # prefer a parse that yields >1 column
+        if best is None or df.shape[1] > best.shape[1]:
+            best = df
+        if df.shape[1] >= 5:
+            break
+    return best if best is not None else pd.DataFrame()
 
 def _read_csv_smart(uploaded_file=None, path=None, url=None):
     # 1) Uploaded file (CSV or ZIP)
@@ -55,7 +67,7 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
                     csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                     if not csvs:
                         return pd.DataFrame()
-                    data = zf.read(csvs[0])  # first CSV inside the ZIP
+                    data = zf.read(csvs[0])
                     return _read_csv_try_seps_from_bytes(data)
             except Exception:
                 return pd.DataFrame()
@@ -64,9 +76,8 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
     # 2) Remote URL (CSV or ZIP)
     if url:
         try:
-            r = requests.get(url, timeout=60)
+            r = requests.get(url, timeout=90)
             r.raise_for_status()
-            # If it's an HTML page (e.g., a release page), don't parse it as CSV
             ctype = r.headers.get("content-type", "").lower()
             if "text/html" in ctype:
                 return pd.DataFrame()
@@ -81,7 +92,7 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
                         return pd.DataFrame()
                     data = zf.read(csvs[0])
                     return _read_csv_try_seps_from_bytes(data)
-            # If file type unclear, try CSV anyway
+            # unknown content-type: try CSV
             return _read_csv_try_seps_from_bytes(raw)
         except Exception:
             return pd.DataFrame()
@@ -100,8 +111,9 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
                         return pd.DataFrame()
                     data = zf.read(csvs[0])
                     return _read_csv_try_seps_from_bytes(data)
-            # Fallback: let pandas guess
-            return pd.read_csv(path)
+            # fallback: let pandas guess with robust options
+            df = pd.read_csv(path, low_memory=False, on_bad_lines="skip", engine="python")
+            return df
         except Exception:
             return pd.DataFrame()
 
@@ -117,10 +129,10 @@ custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (local run
 remote_url  = st.sidebar.text_input(
     "…or enter a direct remote URL (CSV/ZIP)",
     value="",
-    help="For GitHub Releases it must be /releases/download/<tag>/<file>.csv (or .zip); Dropbox links should end with ?dl=1"
+    help="GitHub Releases must be /releases/download/<tag>/<file>.csv (or .zip). Dropbox links end with ?dl=1"
 )
 
-# Optional: reuse a data_path variable from a local module if present
+# Optional: reuse a local constant if available
 try:
     import importlib
     project_mod = importlib.import_module("project_sl")
@@ -132,24 +144,22 @@ except Exception:
 
 df_raw = load_data(uploaded_csv, custom_path, remote_url)
 
-# If a remote URL was provided but parsing failed, guide the user clearly
+# User feedback if URL provided but not parsed
 if remote_url and df_raw.empty:
     st.sidebar.error(
         "Could not load data from the provided URL. "
-        "Make sure it is a **direct file link** (downloads a .csv or .zip). "
+        "Use a **direct file link** (it should download a .csv or .zip). "
         "For GitHub Releases: /releases/download/<tag>/<file>.csv (or .zip)."
     )
 
 if not df_raw.empty and df_raw.shape[1] == 1:
     st.sidebar.warning(
-        "Data loaded as a single column. The parser tries ',', ';', tab, and '|'. "
-        "If columns still look wrong, consider using a different source or a ZIP with a clean CSV."
+        "Data loaded as a single column. The parser tried ',', ';', tab, and '|'. "
+        "If columns still look wrong, consider providing a ZIP that contains a clean CSV."
     )
 
 # =========================
 # Data preparation
-# Harmonize column names, filter definitive data, parse datetime,
-# calendar features, production totals, balances, etc.
 # =========================
 RENAME_FR_EN = {
     'Code INSEE région': 'INSEE_region_code',
@@ -187,39 +197,50 @@ def _drop_all_zero_cols(d, names=('Battery_storage','Battery_destock','Wind_onsh
 def preprocess(df):
     if df.empty:
         return df
+
+    # standardize column names (first try exact French headers)
     df = df.rename(RENAME_FR_EN, axis=1)
 
+    # If columns are generic (e.g., 0,1,2…) due to bad CSV, attempt a second pass by stripping spaces
+    if 'Date - Heure' in df.columns and 'Date-Time' not in df.columns:
+        df = df.rename(columns={'Date - Heure': 'Date-Time'})
+
+    # Filter definitive data if present
     if 'Nature' in df.columns:
         m = df['Nature'].astype(str).str.contains("Données définitives|Definitive data", case=False, regex=True)
         if m.any():
             df = df[m].copy()
         df['Nature'] = df['Nature'].replace('Données définitives', 'Definitive data')
 
-    if 'Date-Time' in df.columns and df['Date-Time'].dtype == object:
+    # Normalize "Date-Time" even if mixed/object; strip timezone suffix if any
+    if 'Date-Time' in df.columns:
         dt_str = df['Date-Time'].astype(str)
-        df['Date-Time'] = np.where(dt_str.str.match(r'.*\+\d{2}:\d{2}$'), dt_str.str[:-6], dt_str)
+        # remove trailing timezone like "+02:00" if present
+        dt_str = np.where(pd.Series(dt_str).str.match(r'.*\+\d{2}:\d{2}$', na=False), pd.Series(dt_str).str[:-6], dt_str)
+        df['Date-Time'] = pd.to_datetime(dt_str, errors='coerce')
 
+    # Parse "Date" if present
     if 'Date' in df.columns:
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    if 'Date-Time' in df.columns:
-        df['Date-Time'] = pd.to_datetime(df['Date-Time'], errors='coerce')
 
+    # Calendar fields
     if 'Date' in df.columns:
         df['Year'] = df['Date'].dt.year
         df['Month'] = df['Date'].dt.month
         df['Weekday'] = df['Date'].dt.day_name()
-    if 'Date-Time' in df.columns:
+    if 'Date-Time' in df.columns and df['Date-Time'].notna().any():
         df['Hour'] = df['Date-Time'].dt.hour
+        # Optional YearMonth; keep as string to avoid Period dtype issues downstream
         if 'YearMonth' not in df.columns:
-            try:
-                df['YearMonth'] = df['Date-Time'].dt.to_period("M")
-            except Exception:
-                pass
+            ym = df['Date-Time'].dt.strftime('%Y-%m')
+            df['YearMonth'] = ym
 
+    # Numeric coercion for main columns
     for c in MAIN_SOURCES + ['Consumption','Physical_exchanges','Pumped_storage']:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
+    # Totals & balances
     if all(c in df.columns for c in MAIN_SOURCES):
         df['ProdTotal'] = df[MAIN_SOURCES].sum(axis=1)
         if 'Physical_exchanges' in df.columns:
@@ -237,6 +258,15 @@ def preprocess(df):
     return df
 
 df = preprocess(df_raw)
+
+# If key columns missing, stop early so pages don't crash
+required_any = ['Date-Time', 'Consumption']
+if not df.empty and (not set(required_any).issubset(df.columns)):
+    st.sidebar.error(
+        "The dataset loaded but required columns are missing. "
+        "Expected at least 'Date-Time' and 'Consumption'. "
+        "Please verify the file separator and that you provided the correct file."
+    )
 
 if df.empty:
     st.info("No data loaded yet. Upload a CSV/ZIP, paste a direct Remote URL (CSV/ZIP), or enter a valid local path.")
@@ -286,11 +316,11 @@ if page == pages[0] and not df.empty:
 # =========================
 # Page 2 — DataVizualization
 # =========================
-if page == pages[1] and not df.empty:
+if page == pages[1] and not df.empty and set(required_any).issubset(df.columns):
     st.write("### DataVizualization")
 
     try:
-        # Optional energy conversion: half-hourly MW → MWh (×0.5) for energy totals
+        # Optional: half-hourly MW → MWh (×0.5) for energy totals
         convert_to_mwh = st.checkbox("Convert MW (half-hourly) to MWh (×0.5) for energy totals", value=False)
         if convert_to_mwh:
             df_plot = df.copy()
@@ -318,7 +348,7 @@ if page == pages[1] and not df.empty:
             if 'Weekday' not in df_plot.columns:
                 df_plot['Weekday'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.day_name()
 
-        # Numeric detection robustly
+        # Numeric columns (robustly)
         def numeric_columns(d):
             return [c for c in d.columns if is_numeric_dtype(d[c])]
 
@@ -333,7 +363,8 @@ if page == pages[1] and not df.empty:
 
         # --- General plots ---
         with tab1:
-            cat_cols = [c for c in df_plot.columns if (df_plot[c].dtype == 'object') or (getattr(df_plot[c].dtype, "name", "") == 'category')]
+            cat_cols = [c for c in df_plot.columns
+                        if (df_plot[c].dtype == 'object') or (getattr(df_plot[c].dtype, "name", "") == 'category')]
             if cat_cols:
                 chosen_cat = st.selectbox("Countplot — choose a categorical column", options=cat_cols, key="cat1")
                 fig = plt.figure()
@@ -499,16 +530,16 @@ if page == pages[1] and not df.empty:
 
     except Exception as e:
         st.error("Visualization error. Please verify your data source and try again.")
-        # Uncomment the next line if you want the traceback during debugging:
-        # st.exception(e)
+        # st.exception(e)  # enable if you want the traceback while debugging
 
 # =========================
 # Page 3 — Modelling
 # =========================
-if page == pages[2] and not df.empty:
+if page == pages[2] and not df.empty and set(required_any).issubset(df.columns):
     st.write("### Modelling (Consumption forecasting demo)")
 
-    if not {'Date-Time','Consumption'}.issubset(df.columns):
+    model_ready = {'Date-Time','Consumption'}.issubset(df.columns)
+    if not model_ready:
         st.warning("Required columns missing: Date-Time and Consumption.")
     else:
         model_choice = st.selectbox("Model", ["Decision Tree Regressor", "Random Forest Regressor"])
