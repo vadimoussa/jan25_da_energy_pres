@@ -1,7 +1,7 @@
-import os
-import io
-import base64
-import zipfile
+import os, io, base64, zipfile
+import matplotlib
+matplotlib.use("Agg")  # safe, headless backend for Streamlit
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.graph_objects as go
 import plotly.express as px
-from pandas.api.types import is_numeric_dtype  # robust numeric checker (handles Period, etc.)
+from pandas.api.types import is_numeric_dtype
 
 # =========================
 # App title & navigation
@@ -21,27 +21,32 @@ page = st.sidebar.radio("Go to", pages)
 
 # =========================
 # Data loading
-# Supports: upload OR local path
-# Auto-detects common separators; reads CSV or ZIP (with one CSV inside)
+# - Upload CSV or ZIP (containing one CSV)
+# - Local path works only when running locally
+# - Auto-detect separators: , ; \t |
 # =========================
 def _read_csv_smart(uploaded_file=None, path=None):
-    """Load from uploaded CSV/ZIP or local CSV/ZIP; auto-detect separators."""
     seps = [",", ";", "\t", "|"]
 
-    def read_csv_try_seps(buf_bytes: bytes) -> pd.DataFrame:
+    def read_csv_try_seps(buf_bytes):
+        # Try multiple separators on the same buffer
         bio = io.BytesIO(buf_bytes)
         for s in seps:
             try:
                 bio.seek(0)
-                return pd.read_csv(bio, sep=s)
+                df = pd.read_csv(bio, sep=s)
+                # Heuristic: avoid the classic "everything in one column" mistake
+                if df.shape[1] == 1 and s != seps[-1]:
+                    continue
+                return df
             except Exception:
-                continue
+                pass
         return pd.DataFrame()
 
     # -------- Uploaded file --------
     if uploaded_file is not None:
-        name = uploaded_file.name.lower()
-        raw = uploaded_file.read()
+        name = (uploaded_file.name or "").lower()
+        raw = uploaded_file.read() or b""
 
         if name.endswith(".csv"):
             return read_csv_try_seps(raw)
@@ -52,30 +57,28 @@ def _read_csv_smart(uploaded_file=None, path=None):
                     csv_members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                     if not csv_members:
                         return pd.DataFrame()
-                    data = zf.read(csv_members[0])  # bytes of the CSV
+                    # read the first CSV file inside the zip
+                    data = zf.read(csv_members[0])
                     return read_csv_try_seps(data)
-            except zipfile.BadZipFile:
+            except Exception:
                 return pd.DataFrame()
-
         return pd.DataFrame()
 
     # -------- Local path (when running locally) --------
     if path and os.path.exists(path):
         pl = path.lower()
-        if pl.endswith(".csv"):
-            with open(path, "rb") as f:
-                return read_csv_try_seps(f.read())
-        if pl.endswith(".zip"):
-            try:
+        try:
+            if pl.endswith(".csv"):
+                with open(path, "rb") as f:
+                    return read_csv_try_seps(f.read())
+            if pl.endswith(".zip"):
                 with zipfile.ZipFile(path) as zf:
                     csv_members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                     if not csv_members:
                         return pd.DataFrame()
                     data = zf.read(csv_members[0])
                     return read_csv_try_seps(data)
-            except zipfile.BadZipFile:
-                return pd.DataFrame()
-        try:
+            # fallback
             return pd.read_csv(path)
         except Exception:
             return pd.DataFrame()
@@ -88,29 +91,20 @@ def load_data(uploaded_file=None, path=None):
 
 st.sidebar.subheader("Data source")
 uploaded_csv = st.sidebar.file_uploader("Upload CSV/ZIP (≤200 MB)", type=["csv", "zip"])
-custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (no size limit when running locally)", value="")
+custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (works only when running locally)", value="")
 
-# Optional: reuse a data_path variable from a local module if present
-try:
-    import importlib
-    project_mod = importlib.import_module("project_sl")
-    default_path = getattr(project_mod, "data_path", "")
-    if not uploaded_csv and not custom_path and default_path:
-        custom_path = default_path
-except Exception:
-    pass
-
+# IMPORTANT: we do NOT auto-import any local module here to avoid server crashes
 df_raw = load_data(uploaded_csv, custom_path)
 
-# Helpful warning if separator was wrong and everything collapsed into one column
+# Helpful warning if everything collapsed into one column
 if not df_raw.empty and df_raw.shape[1] == 1:
-    st.sidebar.warning("Data loaded as a single column. The parser tries ',', ';', tab, and '|'. "
-                       "If columns still look wrong, re-check the file or try another separator.")
+    st.sidebar.warning(
+        "Data loaded as a single column. The parser tries ',', ';', tab, and '|'. "
+        "If columns still look wrong, please re-upload the ZIP/CSV."
+    )
 
 # =========================
 # Data preparation
-# Harmonize column names, filter definitive data, parse datetime,
-# calendar features, production totals, balances, etc.
 # =========================
 RENAME_FR_EN = {
     'Code INSEE région': 'INSEE_region_code',
@@ -147,40 +141,53 @@ def _drop_all_zero_cols(d, names=('Battery_storage','Battery_destock','Wind_onsh
 
 def preprocess(df):
     if df.empty:
-        return df
-    df = df.rename(RENAME_FR_EN, axis=1)
+        return df.copy()
+    df = df.copy().rename(RENAME_FR_EN, axis=1)
 
+    # Keep definitive data if present
     if 'Nature' in df.columns:
-        m = df['Nature'].astype(str).str.contains("Données définitives|Definitive data", case=False, regex=True)
-        if m.any():
-            df = df[m].copy()
-        df['Nature'] = df['Nature'].replace('Données définitives', 'Definitive data')
+        try:
+            m = df['Nature'].astype(str).str.contains("Données définitives|Definitive data", case=False, regex=True)
+            if m.any():
+                df = df[m].copy()
+            df['Nature'] = df['Nature'].replace('Données définitives', 'Definitive data')
+        except Exception:
+            pass
 
+    # Clean timezone suffix in Date-Time if present
     if 'Date-Time' in df.columns and df['Date-Time'].dtype == object:
-        dt_str = df['Date-Time'].astype(str)
-        df['Date-Time'] = np.where(dt_str.str.match(r'.*\+\d{2}:\d{2}$'), dt_str.str[:-6], dt_str)
+        try:
+            dt_str = df['Date-Time'].astype(str)
+            df['Date-Time'] = np.where(dt_str.str.match(r'.*\+\d{2}:\d{2}$'), dt_str.str[:-6], dt_str)
+        except Exception:
+            pass
 
+    # Parse dates
     if 'Date' in df.columns:
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     if 'Date-Time' in df.columns:
         df['Date-Time'] = pd.to_datetime(df['Date-Time'], errors='coerce')
 
+    # Calendar features
     if 'Date' in df.columns:
         df['Year'] = df['Date'].dt.year
         df['Month'] = df['Date'].dt.month
         df['Weekday'] = df['Date'].dt.day_name()
     if 'Date-Time' in df.columns:
         df['Hour'] = df['Date-Time'].dt.hour
+        # Keep as Period if available (used only for grouping/labels)
         if 'YearMonth' not in df.columns:
             try:
                 df['YearMonth'] = df['Date-Time'].dt.to_period("M")
             except Exception:
                 pass
 
+    # Numeric casting
     for c in MAIN_SOURCES + ['Consumption','Physical_exchanges','Pumped_storage']:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
+    # Production totals
     if all(c in df.columns for c in MAIN_SOURCES):
         df['ProdTotal'] = df[MAIN_SOURCES].sum(axis=1)
         if 'Physical_exchanges' in df.columns:
@@ -188,11 +195,16 @@ def preprocess(df):
         else:
             df['ProdTotal_PhyEx'] = df['ProdTotal']
 
+    # Balances and aggregates
     if 'Consumption' in df.columns and 'ProdTotal' in df.columns:
         renew_cols = [c for c in ['Wind','Solar','Hydraulic','Biomass'] if c in df.columns]
-        df['Diff_ProdTotal'] = df['ProdTotal'] - df['Consumption']
-        df['Renewables'] = df[renew_cols].sum(axis=1) if renew_cols else np.nan
-        df['LowCO2'] = df[['Nuclear'] + renew_cols].sum(axis=1) if 'Nuclear' in df.columns and renew_cols else np.nan
+        try:
+            df['Diff_ProdTotal'] = df['ProdTotal'] - df['Consumption']
+            df['Renewables'] = df[renew_cols].sum(axis=1) if renew_cols else np.nan
+            if 'Nuclear' in df.columns and renew_cols:
+                df['LowCO2'] = df[['Nuclear'] + renew_cols].sum(axis=1)
+        except Exception:
+            pass
 
     df = _drop_all_zero_cols(df)
     return df
@@ -250,7 +262,6 @@ if page == pages[0] and not df.empty:
 if page == pages[1] and not df.empty:
     st.write("### DataVizualization")
 
-    # Optional energy conversion: half-hourly MW → MWh (×0.5) for energy totals
     convert_to_mwh = st.checkbox("Convert MW (half-hourly) to MWh (×0.5) for energy totals", value=False)
     if convert_to_mwh:
         df_plot = df.copy()
@@ -262,14 +273,12 @@ if page == pages[1] and not df.empty:
         df_plot = df.copy()
         unit_note = ""
 
-    # Region filter
     if 'Region' in df_plot.columns:
         regions = sorted([str(x) for x in df_plot['Region'].dropna().unique()])
         chosen_regions = st.multiselect("Filter by region", options=regions, default=regions[:1] if regions else [])
         if chosen_regions:
             df_plot = df_plot[df_plot['Region'].astype(str).isin(chosen_regions)]
 
-    # Ensure calendar fields
     if 'Date-Time' in df_plot.columns:
         if 'Month' not in df_plot.columns:
             df_plot['Month'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.month
@@ -278,52 +287,35 @@ if page == pages[1] and not df.empty:
         if 'Weekday' not in df_plot.columns:
             df_plot['Weekday'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.day_name()
 
-    # Robust numeric detection
     def numeric_columns(d):
         return [c for c in d.columns if is_numeric_dtype(d[c])]
 
     numeric_cols = numeric_columns(df_plot)
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "General plots",
-        "Monthly seasonality",
-        "Weekly / Hourly by Region",
-        "Grid balance & mix"
-    ])
+    tab1, tab2, tab3, tab4 = st.tabs(["General plots","Monthly seasonality","Weekly / Hourly by Region","Grid balance & mix"])
 
-    # --- General plots ---
     with tab1:
-        cat_cols = [c for c in df_plot.columns if df_plot[c].dtype == 'object' or df_plot[c].dtype.name == 'category']
+        cat_cols = [c for c in df_plot.columns if dtypestr := getattr(df_plot[c].dtype, "name", str(df_plot[c].dtype)) in ["object","category"] or df_plot[c].dtype == object]
         if cat_cols:
             chosen_cat = st.selectbox("Countplot — choose a categorical column", options=cat_cols, key="cat1")
-            fig = plt.figure()
-            sns.countplot(x=chosen_cat, data=df_plot)
-            plt.title(f"Distribution of {chosen_cat}")
-            plt.xticks(rotation=45, ha="right")
-            st.pyplot(fig)
+            fig = plt.figure(); sns.countplot(x=chosen_cat, data=df_plot)
+            plt.title(f"Distribution of {chosen_cat}"); plt.xticks(rotation=45, ha="right"); st.pyplot(fig)
 
         if numeric_cols:
             chosen_num = st.selectbox("Histogram — choose a numeric column", options=numeric_cols, key="num1")
             bins = st.slider("Number of bins", 5, 100, 30, key="bins1")
-            fig2 = plt.figure()
-            sns.histplot(df_plot[chosen_num].dropna(), bins=bins)
-            plt.title(f"Distribution of {chosen_num}")
-            st.pyplot(fig2)
+            fig2 = plt.figure(); sns.histplot(df_plot[chosen_num].dropna(), bins=bins)
+            plt.title(f"Distribution of {chosen_num}"); st.pyplot(fig2)
 
         if 'Date-Time' in df_plot.columns and numeric_cols:
             st.write("**Time series line plot**")
             y_col = st.selectbox("Y-axis numeric column", options=numeric_cols, key="ts_y1")
             ts = df_plot[['Date-Time', y_col]].dropna().sort_values('Date-Time')
-            fig3 = plt.figure()
-            plt.plot(ts['Date-Time'], ts[y_col])
-            plt.title(f"{y_col} over time{unit_note}")
-            plt.xlabel("Date-Time")
-            plt.ylabel(y_col)
-            plt.xticks(rotation=25, ha="right")
-            st.pyplot(fig3)
+            fig3 = plt.figure(); plt.plot(ts['Date-Time'], ts[y_col])
+            plt.title(f"{y_col} over time{unit_note}"); plt.xlabel("Date-Time"); plt.ylabel(y_col)
+            plt.xticks(rotation=25, ha="right"); st.pyplot(fig3)
             st.caption("Shows daily, weekly, and seasonal structure in the series.")
 
-    # --- Monthly seasonality ---
     with tab2:
         st.write("#### Monthly seasonality (averages by month)")
         if 'Month' in df_plot.columns:
@@ -332,22 +324,12 @@ if page == pages[1] and not df.empty:
             if y_options:
                 y_metric = st.selectbox("Metric", options=y_options, index=0, key="mon_metric")
                 agg = df_plot.groupby('Month')[y_metric].mean().reindex(range(1,13))
-
-                fig_line = plt.figure()
-                plt.plot(agg.index, agg.values, marker="o")
-                plt.title(f"Average {y_metric} by Month{unit_note}")
-                plt.xlabel("Month (1–12)")
-                plt.ylabel(f"Avg {y_metric}")
-                plt.xticks(range(1,13))
-                st.pyplot(fig_line)
-
-                fig_bar = plt.figure()
-                plt.bar(agg.index, agg.values)
-                plt.title(f"Average {y_metric} by Month{unit_note}")
-                plt.xlabel("Month (1–12)")
-                plt.ylabel(f"Avg {y_metric}")
-                plt.xticks(range(1,13))
-                st.pyplot(fig_bar)
+                fig_line = plt.figure(); plt.plot(agg.index, agg.values, marker="o")
+                plt.title(f"Average {y_metric} by Month{unit_note}"); plt.xlabel("Month (1–12)"); plt.ylabel(f"Avg {y_metric}")
+                plt.xticks(range(1,13)); st.pyplot(fig_line)
+                fig_bar = plt.figure(); plt.bar(agg.index, agg.values)
+                plt.title(f"Average {y_metric} by Month{unit_note}"); plt.xlabel("Month (1–12)"); plt.ylabel(f"Avg {y_metric}")
+                plt.xticks(range(1,13)); st.pyplot(fig_bar)
                 st.caption("Higher winter demand and summer troughs are visible.")
 
         sources = [c for c in ['Nuclear','Wind','Solar','Hydraulic','Thermal','Biomass'] if c in df_plot.columns]
@@ -356,68 +338,42 @@ if page == pages[1] and not df.empty:
             monthly = df_plot.groupby('Month')[sources].mean().reindex(range(1,13))
             as_share = st.checkbox("Show as shares (0–100%)", value=True, key="mix_share")
             plot_data = monthly.div(monthly.sum(axis=1), axis=0)*100 if as_share else monthly
-
-            fig_mix = plt.figure()
-            bottom = np.zeros(len(plot_data))
+            fig_mix = plt.figure(); bottom = np.zeros(len(plot_data))
             for col in plot_data.columns:
-                plt.bar(plot_data.index, plot_data[col].values, bottom=bottom, label=col)
-                bottom += plot_data[col].values
+                plt.bar(plot_data.index, plot_data[col].values, bottom=bottom, label=col); bottom += plot_data[col].values
             ttl = "Monthly Energy Mix (share %)" if as_share else f"Monthly Energy Mix (avg level{unit_note})"
-            plt.title(ttl)
-            plt.xlabel("Month (1–12)")
-            plt.legend(loc='upper right', ncol=2)
-            st.pyplot(fig_mix)
+            plt.title(ttl); plt.xlabel("Month (1–12)"); plt.legend(loc='upper right', ncol=2); st.pyplot(fig_mix)
             st.caption("Nuclear provides stable low-CO₂ base; wind/solar vary; hydro adds flexibility.")
 
-    # --- Weekly / Hourly by Region ---
     with tab3:
         st.write("#### Weekly and Hourly demand profiles")
         if {'Weekday','Hour'}.issubset(df_plot.columns):
             ordered_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-            try:
-                df_plot['Weekday'] = pd.Categorical(df_plot['Weekday'], categories=ordered_days, ordered=True)
-            except Exception:
-                pass
-
+            try: df_plot['Weekday'] = pd.Categorical(df_plot['Weekday'], categories=ordered_days, ordered=True)
+            except Exception: pass
             y_options = [c for c in ['Consumption','ProdTotal'] if c in df_plot.columns] or numeric_cols
             if y_options:
                 y_metric = st.selectbox("Metric", options=y_options, key="prof_metric")
-
                 if 'Region' in df_plot.columns:
-                    region_for_profile = st.selectbox(
-                        "Region (optional)", options=["<All>"] + sorted(df_plot['Region'].astype(str).unique().tolist()), index=0
-                    )
+                    region_for_profile = st.selectbox("Region (optional)", options=["<All>"] + sorted(df_plot['Region'].astype(str).unique().tolist()), index=0)
                     dprof = df_plot if region_for_profile == "<All>" else df_plot[df_plot['Region'].astype(str) == region_for_profile]
                 else:
                     dprof = df_plot
-
                 wk = dprof.groupby('Weekday')[y_metric].mean()
-                fig_wk = plt.figure()
-                plt.plot(wk.index, wk.values, marker="o")
-                plt.title(f"Average {y_metric} by Weekday{unit_note}")
-                plt.xlabel("Weekday"); plt.ylabel(f"Avg {y_metric}")
-                plt.xticks(rotation=25, ha="right")
-                st.pyplot(fig_wk)
-
+                fig_wk = plt.figure(); plt.plot(wk.index, wk.values, marker="o")
+                plt.title(f"Average {y_metric} by Weekday{unit_note}"); plt.xlabel("Weekday"); plt.ylabel(f"Avg {y_metric}")
+                plt.xticks(rotation=25, ha="right"); st.pyplot(fig_wk)
                 hr = dprof.groupby('Hour')[y_metric].mean().reindex(range(24))
-                fig_hr = plt.figure()
-                plt.plot(hr.index, hr.values, marker="o")
-                plt.title(f"Average {y_metric} by Hour{unit_note}")
-                plt.xlabel("Hour (0–23)"); plt.ylabel(f"Avg {y_metric}")
-                plt.xticks(range(0,24,2))
-                st.pyplot(fig_hr)
-
+                fig_hr = plt.figure(); plt.plot(hr.index, hr.values, marker="o")
+                plt.title(f"Average {y_metric} by Hour{unit_note}"); plt.xlabel("Hour (0–23)"); plt.ylabel(f"Avg {y_metric}")
+                plt.xticks(range(0,24,2)); st.pyplot(fig_hr)
                 pivot = dprof.pivot_table(index='Weekday', columns='Hour', values=y_metric, aggfunc='mean').reindex(ordered_days)
-                fig_hm = plt.figure()
-                sns.heatmap(pivot, annot=False)
-                plt.title(f"{y_metric} — Weekday × Hour{unit_note}")
-                plt.xlabel("Hour"); plt.ylabel("Weekday")
-                st.pyplot(fig_hm)
+                fig_hm = plt.figure(); sns.heatmap(pivot, annot=False)
+                plt.title(f"{y_metric} — Weekday × Hour{unit_note}"); plt.xlabel("Hour"); plt.ylabel("Weekday"); st.pyplot(fig_hm)
                 st.caption("Profiles reflect commuting and evening peaks on weekdays.")
         else:
             st.info("Weekday/Hour not available. Ensure 'Date-Time' exists and is parsed.")
 
-    # --- Grid balance & mix ---
     with tab4:
         if {'Year'}.issubset(df_plot.columns) and all(c in df_plot.columns for c in MAIN_SOURCES) and 'Consumption' in df_plot.columns:
             st.write("**Yearly Energy Production (by source) vs Consumption (TWh)**")
@@ -425,20 +381,20 @@ if page == pages[1] and not df.empty:
             yearly_prod = (df_plot.groupby('Year')[MAIN_SOURCES].sum() / denom)
             yearly_cons = (df_plot.groupby('Year')['Consumption'].sum() / denom)
             years = yearly_prod.index.tolist()
-
             colors = px.colors.qualitative.Set3
             fig = go.Figure()
             for i, col in enumerate(MAIN_SOURCES):
                 fig.add_trace(go.Bar(x=years, y=yearly_prod[col], name=col, marker_color=colors[i % len(colors)]))
             fig.add_trace(go.Scatter(x=years, y=yearly_cons, mode='lines+markers', name='Consumption', line=dict(width=3)))
-            fig.update_layout(barmode='stack', template='plotly_white', height=520,
-                              xaxis_title='Year', yaxis_title='Energy (TWh)')
+            fig.update_layout(barmode='stack', template='plotly_white', height=520, xaxis_title='Year', yaxis_title='Energy (TWh)')
             st.plotly_chart(fig, use_container_width=True)
             st.caption("ProdTotal = Thermal + Nuclear + Wind + Solar + Hydraulic + Biomass.")
 
         if {'Region','Consumption','ProdTotal'}.issubset(df_plot.columns):
             st.write("**Net Energy Balance by Region**  \n(Consumption − ProdTotal; positive = deficit)")
             bal = df_plot.groupby('Region')[['Consumption','ProdTotal']].sum()
+            bal['NetBalance'] = bal['Consumption'] - df_plot.groupby('Region')['ProdTotal'].sum()
+            # Recompute correctly (in case of chained ops above)
             bal['NetBalance'] = bal['Consumption'] - bal['ProdTotal']
             bal = bal.sort_values('NetBalance', ascending=True)
             fig_barh = go.Figure(go.Bar(x=bal['NetBalance'], y=bal.index, orientation='h'))
