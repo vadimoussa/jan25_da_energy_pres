@@ -1,6 +1,6 @@
 import os, io, base64, zipfile
 
-# Force headless-friendly Matplotlib backend before importing pyplot
+# Use a headless-safe Matplotlib backend before importing pyplot
 import matplotlib
 matplotlib.use("Agg")
 
@@ -34,7 +34,7 @@ def _read_csv_try_seps_from_bytes(buf_bytes):
         try:
             bio.seek(0)
             df = pd.read_csv(bio, sep=s)
-            # if everything collapsed into 1 col, try next sep
+            # If it collapsed to a single column, try the next separator.
             if df.shape[1] == 1 and s != seps[-1]:
                 continue
             return df
@@ -53,9 +53,9 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
             try:
                 with zipfile.ZipFile(io.BytesIO(raw)) as zf:
                     csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                    if not csvs: 
+                    if not csvs:
                         return pd.DataFrame()
-                    data = zf.read(csvs[0])  # first CSV within the zip
+                    data = zf.read(csvs[0])  # first CSV inside the ZIP
                     return _read_csv_try_seps_from_bytes(data)
             except Exception:
                 return pd.DataFrame()
@@ -66,6 +66,10 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
         try:
             r = requests.get(url, timeout=60)
             r.raise_for_status()
+            # If it's an HTML page (e.g., a release page), don't parse it as CSV
+            ctype = r.headers.get("content-type", "").lower()
+            if "text/html" in ctype:
+                return pd.DataFrame()
             raw = r.content
             url_l = url.lower()
             if url_l.endswith(".csv"):
@@ -92,7 +96,7 @@ def _read_csv_smart(uploaded_file=None, path=None, url=None):
             if pl.endswith(".zip"):
                 with zipfile.ZipFile(path) as zf:
                     csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                    if not csvs: 
+                    if not csvs:
                         return pd.DataFrame()
                     data = zf.read(csvs[0])
                     return _read_csv_try_seps_from_bytes(data)
@@ -110,9 +114,13 @@ def load_data(uploaded_file=None, path=None, url=None):
 st.sidebar.subheader("Data source")
 uploaded_csv = st.sidebar.file_uploader("Upload CSV or ZIP (≤200 MB)", type=["csv", "zip"])
 custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (local runs)", value="")
-remote_url  = st.sidebar.text_input("…or enter a remote URL (CSV/ZIP)", value="")
+remote_url  = st.sidebar.text_input(
+    "…or enter a direct remote URL (CSV/ZIP)",
+    value="",
+    help="For GitHub Releases it must be /releases/download/<tag>/<file>.csv (or .zip); Dropbox links should end with ?dl=1"
+)
 
-# Optional: reuse a data_path if a local module defines it (ignored on Cloud if missing)
+# Optional: reuse a data_path variable from a local module if present
 try:
     import importlib
     project_mod = importlib.import_module("project_sl")
@@ -124,10 +132,18 @@ except Exception:
 
 df_raw = load_data(uploaded_csv, custom_path, remote_url)
 
+# If a remote URL was provided but parsing failed, guide the user clearly
+if remote_url and df_raw.empty:
+    st.sidebar.error(
+        "Could not load data from the provided URL. "
+        "Make sure it is a **direct file link** (downloads a .csv or .zip). "
+        "For GitHub Releases: /releases/download/<tag>/<file>.csv (or .zip)."
+    )
+
 if not df_raw.empty and df_raw.shape[1] == 1:
     st.sidebar.warning(
         "Data loaded as a single column. The parser tries ',', ';', tab, and '|'. "
-        "If columns still look wrong, consider using a different source or ZIP."
+        "If columns still look wrong, consider using a different source or a ZIP with a clean CSV."
     )
 
 # =========================
@@ -223,7 +239,7 @@ def preprocess(df):
 df = preprocess(df_raw)
 
 if df.empty:
-    st.info("No data loaded yet. Upload a CSV/ZIP, paste a Remote URL (CSV/ZIP), or enter a valid local path.")
+    st.info("No data loaded yet. Upload a CSV/ZIP, paste a direct Remote URL (CSV/ZIP), or enter a valid local path.")
 else:
     with st.sidebar.expander("Columns detected", expanded=False):
         st.write(list(df.columns))
@@ -273,211 +289,218 @@ if page == pages[0] and not df.empty:
 if page == pages[1] and not df.empty:
     st.write("### DataVizualization")
 
-    # Optional energy conversion: half-hourly MW → MWh (×0.5) for energy totals
-    convert_to_mwh = st.checkbox("Convert MW (half-hourly) to MWh (×0.5) for energy totals", value=False)
-    if convert_to_mwh:
-        df_plot = df.copy()
-        for c in MWH_COLUMNS:
-            if c in df_plot.columns:
-                df_plot[c] = pd.to_numeric(df_plot[c], errors='coerce') * 0.5
-        unit_note = " (aggregations in MWh/TWh)"
-    else:
-        df_plot = df.copy()
-        unit_note = ""
-
-    # Region filter
-    if 'Region' in df_plot.columns:
-        regions = sorted([str(x) for x in df_plot['Region'].dropna().unique()])
-        chosen_regions = st.multiselect("Filter by region", options=regions, default=regions[:1] if regions else [])
-        if chosen_regions:
-            df_plot = df_plot[df_plot['Region'].astype(str).isin(chosen_regions)]
-
-    # Ensure calendar fields
-    if 'Date-Time' in df_plot.columns:
-        if 'Month' not in df_plot.columns:
-            df_plot['Month'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.month
-        if 'Hour' not in df_plot.columns:
-            df_plot['Hour'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.hour
-        if 'Weekday' not in df_plot.columns:
-            df_plot['Weekday'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.day_name()
-
-    def numeric_columns(d):
-        return [c for c in d.columns if is_numeric_dtype(d[c])]
-
-    numeric_cols = numeric_columns(df_plot)
-
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "General plots",
-        "Monthly seasonality",
-        "Weekly / Hourly by Region",
-        "Grid balance & mix"
-    ])
-
-    # --- General plots ---
-    with tab1:
-        cat_cols = [c for c in df_plot.columns if df_plot[c].dtype == 'object' or getattr(df_plot[c].dtype, "name", "") == 'category']
-        if cat_cols:
-            chosen_cat = st.selectbox("Countplot — choose a categorical column", options=cat_cols, key="cat1")
-            fig = plt.figure()
-            sns.countplot(x=chosen_cat, data=df_plot)
-            plt.title(f"Distribution of {chosen_cat}")
-            plt.xticks(rotation=45, ha="right")
-            st.pyplot(fig)
-
-        if numeric_cols:
-            chosen_num = st.selectbox("Histogram — choose a numeric column", options=numeric_cols, key="num1")
-            bins = st.slider("Number of bins", 5, 100, 30, key="bins1")
-            fig2 = plt.figure()
-            sns.histplot(df_plot[chosen_num].dropna(), bins=bins)
-            plt.title(f"Distribution of {chosen_num}")
-            st.pyplot(fig2)
-
-        if 'Date-Time' in df_plot.columns and numeric_cols:
-            st.write("**Time series line plot**")
-            y_col = st.selectbox("Y-axis numeric column", options=numeric_cols, key="ts_y1")
-            ts = df_plot[['Date-Time', y_col]].dropna().sort_values('Date-Time')
-            fig3 = plt.figure()
-            plt.plot(ts['Date-Time'], ts[y_col])
-            plt.title(f"{y_col} over time{unit_note}")
-            plt.xlabel("Date-Time")
-            plt.ylabel(y_col)
-            plt.xticks(rotation=25, ha="right")
-            st.pyplot(fig3)
-            st.caption("Shows daily, weekly, and seasonal structure in the series.")
-
-    # --- Monthly seasonality ---
-    with tab2:
-        st.write("#### Monthly seasonality (averages by month)")
-        if 'Month' in df_plot.columns:
-            preferred = [c for c in ['Consumption','ProdTotal'] if c in df_plot.columns]
-            y_options = preferred + [c for c in numeric_cols if c not in preferred]
-            if y_options:
-                y_metric = st.selectbox("Metric", options=y_options, index=0, key="mon_metric")
-                agg = df_plot.groupby('Month')[y_metric].mean().reindex(range(1,13))
-
-                fig_line = plt.figure()
-                plt.plot(agg.index, agg.values, marker="o")
-                plt.title(f"Average {y_metric} by Month{unit_note}")
-                plt.xlabel("Month (1–12)")
-                plt.ylabel(f"Avg {y_metric}")
-                plt.xticks(range(1,13))
-                st.pyplot(fig_line)
-
-                fig_bar = plt.figure()
-                plt.bar(agg.index, agg.values)
-                plt.title(f"Average {y_metric} by Month{unit_note}")
-                plt.xlabel("Month (1–12)")
-                plt.ylabel(f"Avg {y_metric}")
-                plt.xticks(range(1,13))
-                st.pyplot(fig_bar)
-                st.caption("Higher winter demand and summer troughs are visible.")
-
-        sources = [c for c in ['Nuclear','Wind','Solar','Hydraulic','Thermal','Biomass'] if c in df_plot.columns]
-        if 'Month' in df_plot.columns and sources:
-            st.write("#### Monthly energy mix (share over selection)")
-            monthly = df_plot.groupby('Month')[sources].mean().reindex(range(1,13))
-            as_share = st.checkbox("Show as shares (0–100%)", value=True, key="mix_share")
-            plot_data = monthly.div(monthly.sum(axis=1), axis=0)*100 if as_share else monthly
-
-            fig_mix = plt.figure()
-            bottom = np.zeros(len(plot_data))
-            for col in plot_data.columns:
-                plt.bar(plot_data.index, plot_data[col].values, bottom=bottom, label=col)
-                bottom += plot_data[col].values
-            ttl = "Monthly Energy Mix (share %)" if as_share else f"Monthly Energy Mix (avg level{unit_note})"
-            plt.title(ttl)
-            plt.xlabel("Month (1–12)")
-            plt.legend(loc='upper right', ncol=2)
-            st.pyplot(fig_mix)
-            st.caption("Nuclear provides stable low-CO₂ base; wind/solar vary; hydro adds flexibility.")
-
-    # --- Weekly / Hourly by Region ---
-    with tab3:
-        st.write("#### Weekly and Hourly demand profiles")
-        if {'Weekday','Hour'}.issubset(df_plot.columns):
-            ordered_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-            try:
-                df_plot['Weekday'] = pd.Categorical(df_plot['Weekday'], categories=ordered_days, ordered=True)
-            except Exception:
-                pass
-
-            y_options = [c for c in ['Consumption','ProdTotal'] if c in df_plot.columns] or numeric_cols
-            if y_options:
-                y_metric = st.selectbox("Metric", options=y_options, key="prof_metric")
-
-                if 'Region' in df_plot.columns:
-                    region_for_profile = st.selectbox(
-                        "Region (optional)", options=["<All>"] + sorted(df_plot['Region'].astype(str).unique().tolist()), index=0
-                    )
-                    dprof = df_plot if region_for_profile == "<All>" else df_plot[df_plot['Region'].astype(str) == region_for_profile]
-                else:
-                    dprof = df_plot
-
-                wk = dprof.groupby('Weekday')[y_metric].mean()
-                fig_wk = plt.figure()
-                plt.plot(wk.index, wk.values, marker="o")
-                plt.title(f"Average {y_metric} by Weekday{unit_note}")
-                plt.xlabel("Weekday"); plt.ylabel(f"Avg {y_metric}")
-                plt.xticks(rotation=25, ha="right")
-                st.pyplot(fig_wk)
-
-                hr = dprof.groupby('Hour')[y_metric].mean().reindex(range(24))
-                fig_hr = plt.figure()
-                plt.plot(hr.index, hr.values, marker="o")
-                plt.title(f"Average {y_metric} by Hour{unit_note}")
-                plt.xlabel("Hour (0–23)"); plt.ylabel(f"Avg {y_metric}")
-                plt.xticks(range(0,24,2))
-                st.pyplot(fig_hr)
-
-                pivot = dprof.pivot_table(index='Weekday', columns='Hour', values=y_metric, aggfunc='mean').reindex(ordered_days)
-                fig_hm = plt.figure()
-                sns.heatmap(pivot, annot=False)
-                plt.title(f"{y_metric} — Weekday × Hour{unit_note}")
-                plt.xlabel("Hour"); plt.ylabel("Weekday")
-                st.pyplot(fig_hm)
-                st.caption("Profiles reflect commuting and evening peaks on weekdays.")
+    try:
+        # Optional energy conversion: half-hourly MW → MWh (×0.5) for energy totals
+        convert_to_mwh = st.checkbox("Convert MW (half-hourly) to MWh (×0.5) for energy totals", value=False)
+        if convert_to_mwh:
+            df_plot = df.copy()
+            for c in MWH_COLUMNS:
+                if c in df_plot.columns:
+                    df_plot[c] = pd.to_numeric(df_plot[c], errors='coerce') * 0.5
+            unit_note = " (aggregations in MWh/TWh)"
         else:
-            st.info("Weekday/Hour not available. Ensure 'Date-Time' exists and is parsed.")
+            df_plot = df.copy()
+            unit_note = ""
 
-    # --- Grid balance & mix ---
-    with tab4:
-        if {'Year'}.issubset(df_plot.columns) and all(c in df_plot.columns for c in MAIN_SOURCES) and 'Consumption' in df_plot.columns:
-            st.write("**Yearly Energy Production (by source) vs Consumption (TWh)**")
-            denom = 1_000_000.0 if convert_to_mwh else 1e6
-            yearly_prod = (df_plot.groupby('Year')[MAIN_SOURCES].sum() / denom)
-            yearly_cons = (df_plot.groupby('Year')['Consumption'].sum() / denom)
-            years = yearly_prod.index.tolist()
+        # Region filter
+        if 'Region' in df_plot.columns:
+            regions = sorted([str(x) for x in df_plot['Region'].dropna().unique()])
+            chosen_regions = st.multiselect("Filter by region", options=regions, default=regions[:1] if regions else [])
+            if chosen_regions:
+                df_plot = df_plot[df_plot['Region'].astype(str).isin(chosen_regions)]
 
-            colors = px.colors.qualitative.Set3
-            fig = go.Figure()
-            for i, col in enumerate(MAIN_SOURCES):
-                fig.add_trace(go.Bar(x=years, y=yearly_prod[col], name=col, marker_color=colors[i % len(colors)]))
-            fig.add_trace(go.Scatter(x=years, y=yearly_cons, mode='lines+markers', name='Consumption', line=dict(width=3)))
-            fig.update_layout(barmode='stack', template='plotly_white', height=520,
-                              xaxis_title='Year', yaxis_title='Energy (TWh)')
-            st.plotly_chart(fig, use_container_width=True)
-            st.caption("ProdTotal = Thermal + Nuclear + Wind + Solar + Hydraulic + Biomass.")
+        # Ensure calendar fields
+        if 'Date-Time' in df_plot.columns:
+            if 'Month' not in df_plot.columns:
+                df_plot['Month'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.month
+            if 'Hour' not in df_plot.columns:
+                df_plot['Hour'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.hour
+            if 'Weekday' not in df_plot.columns:
+                df_plot['Weekday'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.day_name()
 
-        if {'Region','Consumption','ProdTotal'}.issubset(df_plot.columns):
-            st.write("**Net Energy Balance by Region**  \n(Consumption − ProdTotal; positive = deficit)")
-            bal = df_plot.groupby('Region')[['Consumption','ProdTotal']].sum()
-            bal['NetBalance'] = bal['Consumption'] - bal['ProdTotal']
-            bal = bal.sort_values('NetBalance', ascending=True)
-            fig_barh = go.Figure(go.Bar(x=bal['NetBalance'], y=bal.index, orientation='h'))
-            fig_barh.update_layout(template='plotly_white', height=600,
-                                   xaxis_title=f'Net Balance ({"MWh" if convert_to_mwh else "MW half-hour sums"})',
-                                   yaxis_title='Region')
-            st.plotly_chart(fig_barh, use_container_width=True)
+        # Numeric detection robustly
+        def numeric_columns(d):
+            return [c for c in d.columns if is_numeric_dtype(d[c])]
 
-        mix_cols = [c for c in ['Nuclear','Wind','Solar','Hydraulic','Thermal','Biomass'] if c in df_plot.columns]
-        if mix_cols:
-            st.write("**Energy mix (share over selection)**")
-            mix_series = df_plot[mix_cols].select_dtypes(include=[np.number]).sum()
-            if mix_series.sum() > 0:
-                fig_pie = go.Figure(go.Pie(labels=mix_series.index, values=mix_series.values, hole=0.35))
-                fig_pie.update_layout(template='plotly_white', height=420)
-                st.plotly_chart(fig_pie, use_container_width=True)
-            st.caption("Low-CO₂ = Nuclear + Renewables (Wind, Solar, Hydraulic, Biomass).")
+        numeric_cols = numeric_columns(df_plot)
+
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "General plots",
+            "Monthly seasonality",
+            "Weekly / Hourly by Region",
+            "Grid balance & mix"
+        ])
+
+        # --- General plots ---
+        with tab1:
+            cat_cols = [c for c in df_plot.columns if (df_plot[c].dtype == 'object') or (getattr(df_plot[c].dtype, "name", "") == 'category')]
+            if cat_cols:
+                chosen_cat = st.selectbox("Countplot — choose a categorical column", options=cat_cols, key="cat1")
+                fig = plt.figure()
+                sns.countplot(x=chosen_cat, data=df_plot)
+                plt.title(f"Distribution of {chosen_cat}")
+                plt.xticks(rotation=45, ha="right")
+                st.pyplot(fig)
+
+            if numeric_cols:
+                chosen_num = st.selectbox("Histogram — choose a numeric column", options=numeric_cols, key="num1")
+                bins = st.slider("Number of bins", 5, 100, 30, key="bins1")
+                fig2 = plt.figure()
+                sns.histplot(df_plot[chosen_num].dropna(), bins=bins)
+                plt.title(f"Distribution of {chosen_num}")
+                st.pyplot(fig2)
+
+            if 'Date-Time' in df_plot.columns and numeric_cols:
+                st.write("**Time series line plot**")
+                y_col = st.selectbox("Y-axis numeric column", options=numeric_cols, key="ts_y1")
+                ts = df_plot[['Date-Time', y_col]].dropna().sort_values('Date-Time')
+                fig3 = plt.figure()
+                plt.plot(ts['Date-Time'], ts[y_col])
+                plt.title(f"{y_col} over time{unit_note}")
+                plt.xlabel("Date-Time")
+                plt.ylabel(y_col)
+                plt.xticks(rotation=25, ha="right")
+                st.pyplot(fig3)
+                st.caption("Shows daily, weekly, and seasonal structure in the series.")
+
+        # --- Monthly seasonality ---
+        with tab2:
+            st.write("#### Monthly seasonality (averages by month)")
+            if 'Month' in df_plot.columns:
+                preferred = [c for c in ['Consumption','ProdTotal'] if c in df_plot.columns]
+                y_options = preferred + [c for c in numeric_cols if c not in preferred]
+                if y_options:
+                    y_metric = st.selectbox("Metric", options=y_options, index=0, key="mon_metric")
+                    agg = df_plot.groupby('Month')[y_metric].mean().reindex(range(1,13))
+
+                    fig_line = plt.figure()
+                    plt.plot(agg.index, agg.values, marker="o")
+                    plt.title(f"Average {y_metric} by Month{unit_note}")
+                    plt.xlabel("Month (1–12)")
+                    plt.ylabel(f"Avg {y_metric}")
+                    plt.xticks(range(1,13))
+                    st.pyplot(fig_line)
+
+                    fig_bar = plt.figure()
+                    plt.bar(agg.index, agg.values)
+                    plt.title(f"Average {y_metric} by Month{unit_note}")
+                    plt.xlabel("Month (1–12)")
+                    plt.ylabel(f"Avg {y_metric}")
+                    plt.xticks(range(1,13))
+                    st.pyplot(fig_bar)
+                    st.caption("Higher winter demand and summer troughs are visible.")
+
+            sources = [c for c in ['Nuclear','Wind','Solar','Hydraulic','Thermal','Biomass'] if c in df_plot.columns]
+            if 'Month' in df_plot.columns and sources:
+                st.write("#### Monthly energy mix (share over selection)")
+                monthly = df_plot.groupby('Month')[sources].mean().reindex(range(1,13))
+                as_share = st.checkbox("Show as shares (0–100%)", value=True, key="mix_share")
+                plot_data = monthly.div(monthly.sum(axis=1), axis=0)*100 if as_share else monthly
+
+                fig_mix = plt.figure()
+                bottom = np.zeros(len(plot_data))
+                for col in plot_data.columns:
+                    plt.bar(plot_data.index, plot_data[col].values, bottom=bottom, label=col)
+                    bottom += plot_data[col].values
+                ttl = "Monthly Energy Mix (share %)" if as_share else f"Monthly Energy Mix (avg level{unit_note})"
+                plt.title(ttl)
+                plt.xlabel("Month (1–12)")
+                plt.legend(loc='upper right', ncol=2)
+                st.pyplot(fig_mix)
+                st.caption("Nuclear provides stable low-CO₂ base; wind/solar vary; hydro adds flexibility.")
+
+        # --- Weekly / Hourly by Region ---
+        with tab3:
+            st.write("#### Weekly and Hourly demand profiles")
+            if {'Weekday','Hour'}.issubset(df_plot.columns):
+                ordered_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+                try:
+                    df_plot['Weekday'] = pd.Categorical(df_plot['Weekday'], categories=ordered_days, ordered=True)
+                except Exception:
+                    pass
+
+                y_options = [c for c in ['Consumption','ProdTotal'] if c in df_plot.columns] or numeric_cols
+                if y_options:
+                    y_metric = st.selectbox("Metric", options=y_options, key="prof_metric")
+
+                    if 'Region' in df_plot.columns:
+                        region_for_profile = st.selectbox(
+                            "Region (optional)", options=["<All>"] + sorted(df_plot['Region'].astype(str).unique().tolist()), index=0
+                        )
+                        dprof = df_plot if region_for_profile == "<All>" else df_plot[df_plot['Region'].astype(str) == region_for_profile]
+                    else:
+                        dprof = df_plot
+
+                    wk = dprof.groupby('Weekday')[y_metric].mean()
+                    fig_wk = plt.figure()
+                    plt.plot(wk.index, wk.values, marker="o")
+                    plt.title(f"Average {y_metric} by Weekday{unit_note}")
+                    plt.xlabel("Weekday"); plt.ylabel(f"Avg {y_metric}")
+                    plt.xticks(rotation=25, ha="right")
+                    st.pyplot(fig_wk)
+
+                    hr = dprof.groupby('Hour')[y_metric].mean().reindex(range(24))
+                    fig_hr = plt.figure()
+                    plt.plot(hr.index, hr.values, marker="o")
+                    plt.title(f"Average {y_metric} by Hour{unit_note}")
+                    plt.xlabel("Hour (0–23)"); plt.ylabel(f"Avg {y_metric}")
+                    plt.xticks(range(0,24,2))
+                    st.pyplot(fig_hr)
+
+                    pivot = dprof.pivot_table(index='Weekday', columns='Hour', values=y_metric, aggfunc='mean').reindex(ordered_days)
+                    fig_hm = plt.figure()
+                    sns.heatmap(pivot, annot=False)
+                    plt.title(f"{y_metric} — Weekday × Hour{unit_note}")
+                    plt.xlabel("Hour"); plt.ylabel("Weekday")
+                    st.pyplot(fig_hm)
+                    st.caption("Profiles reflect commuting and evening peaks on weekdays.")
+            else:
+                st.info("Weekday/Hour not available. Ensure 'Date-Time' exists and is parsed.")
+
+        # --- Grid balance & mix ---
+        with tab4:
+            if {'Year'}.issubset(df_plot.columns) and all(c in df_plot.columns for c in MAIN_SOURCES) and 'Consumption' in df_plot.columns:
+                st.write("**Yearly Energy Production (by source) vs Consumption (TWh)**")
+                denom = 1_000_000.0 if convert_to_mwh else 1e6
+                yearly_prod = (df_plot.groupby('Year')[MAIN_SOURCES].sum() / denom)
+                yearly_cons = (df_plot.groupby('Year')['Consumption'].sum() / denom)
+                years = yearly_prod.index.tolist()
+
+                colors = px.colors.qualitative.Set3
+                fig = go.Figure()
+                for i, col in enumerate(MAIN_SOURCES):
+                    fig.add_trace(go.Bar(x=years, y=yearly_prod[col], name=col, marker_color=colors[i % len(colors)]))
+                fig.add_trace(go.Scatter(x=years, y=yearly_cons, mode='lines+markers', name='Consumption', line=dict(width=3)))
+                fig.update_layout(barmode='stack', template='plotly_white', height=520,
+                                  xaxis_title='Year', yaxis_title='Energy (TWh)')
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("ProdTotal = Thermal + Nuclear + Wind + Solar + Hydraulic + Biomass.")
+
+            if {'Region','Consumption','ProdTotal'}.issubset(df_plot.columns):
+                st.write("**Net Energy Balance by Region**  \n(Consumption − ProdTotal; positive = deficit)")
+                bal = df_plot.groupby('Region')[['Consumption','ProdTotal']].sum()
+                bal['NetBalance'] = bal['Consumption'] - bal['ProdTotal']
+                bal = bal.sort_values('NetBalance', ascending=True)
+                fig_barh = go.Figure(go.Bar(x=bal['NetBalance'], y=bal.index, orientation='h'))
+                fig_barh.update_layout(template='plotly_white', height=600,
+                                       xaxis_title=f'Net Balance ({"MWh" if convert_to_mwh else "MW half-hour sums"})',
+                                       yaxis_title='Region')
+                st.plotly_chart(fig_barh, use_container_width=True)
+
+            mix_cols = [c for c in ['Nuclear','Wind','Solar','Hydraulic','Thermal','Biomass'] if c in df_plot.columns]
+            if mix_cols:
+                st.write("**Energy mix (share over selection)**")
+                mix_series = df_plot[mix_cols].select_dtypes(include=[np.number]).sum()
+                if mix_series.sum() > 0:
+                    fig_pie = go.Figure(go.Pie(labels=mix_series.index, values=mix_series.values, hole=0.35))
+                    fig_pie.update_layout(template='plotly_white', height=420)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                st.caption("Low-CO₂ = Nuclear + Renewables (Wind, Solar, Hydraulic, Biomass).")
+
+    except Exception as e:
+        st.error("Visualization error. Please verify your data source and try again.")
+        # Uncomment the next line if you want the traceback during debugging:
+        # st.exception(e)
 
 # =========================
 # Page 3 — Modelling
