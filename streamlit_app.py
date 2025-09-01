@@ -25,71 +25,56 @@ page = st.sidebar.radio("Go to", pages)
 # Auto-detects common separators; reads CSV or ZIP (with one CSV inside)
 # =========================
 def _read_csv_smart(uploaded_file=None, path=None):
+    """Load from uploaded CSV/ZIP or local CSV/ZIP; auto-detect separators."""
     seps = [",", ";", "\t", "|"]
 
-    def read_csv_try_seps(file_like):
-        # try multiple separators; reset pointer if possible between tries
+    def read_csv_try_seps(buf_bytes: bytes) -> pd.DataFrame:
+        bio = io.BytesIO(buf_bytes)
         for s in seps:
             try:
-                return pd.read_csv(file_like, sep=s)
+                bio.seek(0)
+                return pd.read_csv(bio, sep=s)
             except Exception:
-                try:
-                    file_like.seek(0)
-                except Exception:
-                    pass
+                continue
         return pd.DataFrame()
 
-    # ---------- Uploaded file (CSV or ZIP) ----------
+    # -------- Uploaded file --------
     if uploaded_file is not None:
         name = uploaded_file.name.lower()
         raw = uploaded_file.read()
-        bio = io.BytesIO(raw)
 
-        # Plain CSV
         if name.endswith(".csv"):
-            return read_csv_try_seps(io.BytesIO(raw))
+            return read_csv_try_seps(raw)
 
-        # ZIP with a CSV inside
         if name.endswith(".zip"):
             try:
-                with zipfile.ZipFile(bio) as zf:
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
                     csv_members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                     if not csv_members:
                         return pd.DataFrame()
-                    with zf.open(csv_members[0], "r") as f:
-                        # try direct read; if it fails, buffer then try seps
-                        try:
-                            return pd.read_csv(f)
-                        except Exception:
-                            data = f.read()
-                            return read_csv_try_seps(io.BytesIO(data))
+                    data = zf.read(csv_members[0])  # bytes of the CSV
+                    return read_csv_try_seps(data)
             except zipfile.BadZipFile:
                 return pd.DataFrame()
+
         return pd.DataFrame()
 
-    # ---------- Local filesystem path (works when running locally) ----------
+    # -------- Local path (when running locally) --------
     if path and os.path.exists(path):
         pl = path.lower()
-
         if pl.endswith(".csv"):
             with open(path, "rb") as f:
-                return read_csv_try_seps(io.BytesIO(f.read()))
-
+                return read_csv_try_seps(f.read())
         if pl.endswith(".zip"):
             try:
                 with zipfile.ZipFile(path) as zf:
                     csv_members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
                     if not csv_members:
                         return pd.DataFrame()
-                    with zf.open(csv_members[0], "r") as f:
-                        try:
-                            return pd.read_csv(f)
-                        except Exception:
-                            data = f.read()
-                            return read_csv_try_seps(io.BytesIO(data))
+                    data = zf.read(csv_members[0])
+                    return read_csv_try_seps(data)
             except zipfile.BadZipFile:
                 return pd.DataFrame()
-
         try:
             return pd.read_csv(path)
         except Exception:
@@ -116,6 +101,11 @@ except Exception:
     pass
 
 df_raw = load_data(uploaded_csv, custom_path)
+
+# Helpful warning if separator was wrong and everything collapsed into one column
+if not df_raw.empty and df_raw.shape[1] == 1:
+    st.sidebar.warning("Data loaded as a single column. The parser tries ',', ';', tab, and '|'. "
+                       "If columns still look wrong, re-check the file or try another separator.")
 
 # =========================
 # Data preparation
@@ -217,7 +207,6 @@ else:
 
 # =========================
 # Page 1 — Exploration
-# Overview, preview, summary stats
 # =========================
 if page == pages[0] and not df.empty:
     with st.expander("Project Overview", expanded=True):
@@ -257,7 +246,6 @@ if page == pages[0] and not df.empty:
 
 # =========================
 # Page 2 — DataVizualization
-# General plots, seasonality, weekly/hourly profiles, grid balance & mix
 # =========================
 if page == pages[1] and not df.empty:
     st.write("### DataVizualization")
@@ -290,7 +278,7 @@ if page == pages[1] and not df.empty:
         if 'Weekday' not in df_plot.columns:
             df_plot['Weekday'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.day_name()
 
-    # Robust numeric detection (handles Period types elsewhere)
+    # Robust numeric detection
     def numeric_columns(d):
         return [c for c in d.columns if is_numeric_dtype(d[c])]
 
@@ -471,7 +459,6 @@ if page == pages[1] and not df.empty:
 
 # =========================
 # Page 3 — Modelling
-# Chronological split, time features, and short lags
 # =========================
 if page == pages[2] and not df.empty:
     st.write("### Modelling (Consumption forecasting demo)")
