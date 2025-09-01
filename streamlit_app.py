@@ -28,49 +28,14 @@ page = st.sidebar.radio("Go to", pages)
 SEPARATORS = [",", ";", "\t", "|"]
 ENCODINGS = ["utf-8", "latin-1", "cp1252"]
 
-def _try_read_csv(bio_or_path, sep, encoding):
-    try:
-        return pd.read_csv(
-            bio_or_path,
-            sep=sep,
-            encoding=encoding,
-            low_memory=False,
-            on_bad_lines="skip",
-            engine="python",
-        )
-    except Exception:
-        return None
-
-def _read_csv_try_seps_enc_from_bytes(buf_bytes):
-    """
-    Try multiple encodings and separators; pick the one with most columns.
-    """
-    best = None
-    best_cols = -1
-    for enc in ENCODINGS:
-        for sep in SEPARATORS:
-            bio = io.BytesIO(buf_bytes)
-            df = _try_read_csv(bio, sep, enc)
-            if df is None:
-                continue
-            cols = df.shape[1]
-            if cols > best_cols:
-                best = df
-                best_cols = cols
-            if cols >= 5:
-                # early stop if looks reasonable
-                pass
-    return best if best is not None else pd.DataFrame()
-
 def _normalize_url(url: str) -> str:
     u = url.strip()
-    # Dropbox share → direct
+    # Dropbox: convert share to direct
     if "dropbox.com" in u and "dl.dropboxusercontent.com" not in u:
         u = u.replace("www.dropbox.com", "dl.dropboxusercontent.com")
-        u = re.sub(r"\?dl=0($|&)", "?dl=1\\1", u)
         if "dl=1" not in u:
             u += ("&" if "?" in u else "?") + "dl=1"
-    # Google Drive link → direct export
+    # Google Drive: share → direct
     m = re.search(r"drive.google.com/(?:file/d/|open\?id=)([^/?&]+)", u)
     if m:
         file_id = m.group(1)
@@ -78,10 +43,6 @@ def _normalize_url(url: str) -> str:
     return u
 
 def _fetch_url_bytes(url: str):
-    """
-    Returns: (ok: bool, raw: bytes|None, meta: dict)
-    meta keys: status, content_type, length, final_url, error (optional)
-    """
     meta = {"status": None, "content_type": None, "length": None, "final_url": None, "error": None}
     try:
         fixed = _normalize_url(url)
@@ -99,91 +60,128 @@ def _fetch_url_bytes(url: str):
         meta["error"] = str(e)
         return False, None, meta
 
-def _read_from_zip_bytes(raw_zip: bytes, csv_choice: str | None = None) -> pd.DataFrame:
+def _try_read_csv_filelike(open_file_like_fn, sep, encoding, nrows=None):
     """
-    List CSVs and load chosen one; if not chosen, pick the first CSV.
+    open_file_like_fn: callable that returns a fresh binary file-like positioned at start.
+    We call it for every attempt so we don't need to seek/reset.
     """
+    try:
+        f = open_file_like_fn()
+        return pd.read_csv(
+            f,
+            sep=sep,
+            encoding=encoding,
+            low_memory=False,
+            on_bad_lines="skip",
+            engine="python",
+            nrows=nrows,
+        )
+    except Exception:
+        return None
+
+def _auto_csv_from_filelike(open_file_like_fn, nrows=None):
+    best = None
+    best_cols = -1
+    for enc in ENCODINGS:
+        for sep in SEPARATORS:
+            df = _try_read_csv_filelike(open_file_like_fn, sep, enc, nrows=nrows)
+            if df is None:
+                continue
+            cols = df.shape[1]
+            if cols > best_cols:
+                best = df
+                best_cols = cols
+    return best if best is not None else pd.DataFrame()
+
+def _read_zip_from_bytes(raw_zip: bytes, csv_choice: str | None, nrows=None) -> (pd.DataFrame, list[str]):
+    names = []
+    df = pd.DataFrame()
     with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
         names = zf.namelist()
-        # Store names to sidebar for selection
-        st.session_state["_zip_names"] = names
         csvs = [n for n in names if n.lower().endswith(".csv")]
         if not csvs:
-            return pd.DataFrame()
+            return pd.DataFrame(), names
         target = csv_choice or csvs[0]
-        if target not in names:
-            # if user-picked name is not present anymore, fall back
-            target = csvs[0]
-        data = zf.read(target)
-        return _read_csv_try_seps_enc_from_bytes(data)
 
-def _parse_bytes_to_df(raw: bytes, url_hint: str = "", csv_choice: str | None = None) -> pd.DataFrame:
-    if not raw:
-        return pd.DataFrame()
+        def opener():
+            return zf.open(target, "r")  # returns a fresh file-like each time
 
-    is_zip_ext = url_hint.lower().endswith(".zip")
-    looks_like_zip = raw.startswith(b"PK\x03\x04")
+        df = _auto_csv_from_filelike(opener, nrows=nrows)
+    return df, names
 
-    if is_zip_ext or looks_like_zip:
+def _read_csv_or_zip_from_bytes(raw: bytes, url_hint: str = "", csv_choice: str | None = None, nrows=None):
+    looks_like_zip = raw[:4] == b"PK\x03\x04" or (url_hint.lower().endswith(".zip"))
+    if looks_like_zip:
         try:
-            return _read_from_zip_bytes(raw, csv_choice=csv_choice)
+            df, names = _read_zip_from_bytes(raw, csv_choice, nrows=nrows)
+            st.session_state["_zip_names"] = names
+            return df
         except Exception:
-            pass  # fall through and try CSV
+            pass  # fall through and try as CSV
 
-    # try CSV regardless of headers
-    return _read_csv_try_seps_enc_from_bytes(raw)
+    # Try as CSV from bytes
+    def opener():
+        return io.BytesIO(raw)
+    return _auto_csv_from_filelike(opener, nrows=nrows)
 
-def _read_local_path(path: str, csv_choice: str | None = None) -> pd.DataFrame:
+def _read_local_path(path: str, csv_choice: str | None = None, nrows=None):
     pl = path.lower()
     if pl.endswith(".zip"):
         with open(path, "rb") as f:
-            return _read_from_zip_bytes(f.read(), csv_choice=csv_choice)
-    with open(path, "rb") as f:
-        return _read_csv_try_seps_enc_from_bytes(f.read())
+            raw = f.read()
+        df, names = _read_zip_from_bytes(raw, csv_choice, nrows=nrows)
+        st.session_state["_zip_names"] = names
+        return df
+    # CSV
+    def opener():
+        return open(path, "rb")
+    return _auto_csv_from_filelike(opener, nrows=nrows)
 
-def _read_uploaded(uploaded_file, csv_choice: str | None = None) -> pd.DataFrame:
+def _read_uploaded(uploaded_file, csv_choice: str | None = None, nrows=None):
     name = (uploaded_file.name or "").lower()
     raw = uploaded_file.read() or b""
-    if name.endswith(".zip") or raw.startswith(b"PK\x03\x04"):
-        return _read_from_zip_bytes(raw, csv_choice=csv_choice)
-    return _read_csv_try_seps_enc_from_bytes(raw)
+    if name.endswith(".zip") or raw[:4] == b"PK\x03\x04":
+        df, names = _read_zip_from_bytes(raw, csv_choice, nrows=nrows)
+        st.session_state["_zip_names"] = names
+        return df
+    # CSV
+    def opener():
+        return io.BytesIO(raw)
+    return _auto_csv_from_filelike(opener, nrows=nrows)
 
-def _read_csv_smart(uploaded_file=None, path=None, url=None, csv_choice: str | None = None):
+@st.cache_data(show_spinner=False)
+def load_data(uploaded_file=None, path=None, url=None, csv_choice: str | None = None, nrows=None):
     # Uploaded
     if uploaded_file is not None:
-        return _read_uploaded(uploaded_file, csv_choice=csv_choice)
-    # Remote
+        return _read_uploaded(uploaded_file, csv_choice=csv_choice, nrows=nrows)
+    # Remote URL
     if url:
         ok, raw, meta = _fetch_url_bytes(url)
         st.session_state["_last_fetch_meta"] = meta
         if not ok or raw is None:
             return pd.DataFrame()
-        return _parse_bytes_to_df(raw, url_hint=meta.get("final_url") or url, csv_choice=csv_choice)
+        return _read_csv_or_zip_from_bytes(raw, url_hint=meta.get("final_url") or url, csv_choice=csv_choice, nrows=nrows)
     # Local path
     if path and os.path.exists(path):
-        try:
-            return _read_local_path(path, csv_choice=csv_choice)
-        except Exception:
-            return pd.DataFrame()
+        return _read_local_path(path, csv_choice=csv_choice, nrows=nrows)
     return pd.DataFrame()
 
-@st.cache_data(show_spinner=False)
-def load_data(uploaded_file=None, path=None, url=None, csv_choice: str | None = None):
-    return _read_csv_smart(uploaded_file, path, url, csv_choice)
-
 # =========================
-# Sidebar data source
+# Sidebar data source + advanced options
 # =========================
 st.sidebar.subheader("Data source")
 uploaded_csv = st.sidebar.file_uploader("Upload CSV or ZIP (≤200 MB)", type=["csv", "zip"])
 custom_path = st.sidebar.text_input("…or enter a local CSV/ZIP path (local runs)", value="")
-remote_url  = st.sidebar.text_input(
-    "…or enter a direct remote URL (CSV/ZIP)",
-    value="",
-    help="Examples: GitHub Releases direct asset, Dropbox (dl.dropboxusercontent.com), Google Drive export link."
-)
+remote_url  = st.sidebar.text_input("…or enter a direct remote URL (CSV/ZIP)", value="")
 
-# Optional: reuse a local constant if available
+st.sidebar.markdown("---")
+st.sidebar.subheader("Advanced loading")
+use_sample = st.sidebar.checkbox("Load only first N rows (memory-safe)", value=True)
+sample_n = st.sidebar.number_input("N rows to read", min_value=10000, max_value=2_000_000, value=100_000, step=50_000)
+
+nrows = sample_n if use_sample else None
+
+# Optional default path from a local module
 try:
     import importlib
     project_mod = importlib.import_module("project_sl")
@@ -193,45 +191,31 @@ try:
 except Exception:
     pass
 
-# If last fetch was a ZIP, offer a chooser for CSV entry
+# If previous fetch revealed a ZIP, allow the user to choose the CSV
 zip_names = st.session_state.get("_zip_names") or []
 csv_inside_zip = None
-if remote_url or uploaded_csv or (custom_path and os.path.exists(custom_path)):
-    if zip_names:
-        csv_candidates = [n for n in zip_names if n.lower().endswith(".csv")]
-        if csv_candidates:
-            csv_inside_zip = st.sidebar.selectbox(
-                "If ZIP has multiple CSVs, choose one",
-                options=csv_candidates,
-                index=0,
-                help="Pick the CSV to load from inside the ZIP archive."
-            )
+if (remote_url or uploaded_csv or (custom_path and os.path.exists(custom_path))) and zip_names:
+    csv_candidates = [n for n in zip_names if n.lower().endswith(".csv")]
+    if csv_candidates:
+        csv_inside_zip = st.sidebar.selectbox("CSV inside ZIP", options=csv_candidates, index=0)
 
-df_raw = load_data(uploaded_csv, custom_path, remote_url, csv_inside_zip)
+# Load data
+df_raw = load_data(uploaded_csv, custom_path, remote_url, csv_inside_zip, nrows=nrows)
 
-# Debug panel for last fetch (only if URL used)
+# Debug info
 if remote_url:
     meta = st.session_state.get("_last_fetch_meta")
     with st.sidebar.expander("Remote fetch debug", expanded=False):
-        if meta:
-            st.write({k: v for k, v in meta.items() if v is not None})
-        else:
-            st.write("No fetch attempted or cached.")
+        st.write(meta or "No fetch info yet")
     if st.session_state.get("_zip_names"):
-        with st.sidebar.expander("ZIP contents", expanded=False):
+        with st.sidebar.expander("ZIP contents", expanded=True):
             st.write(st.session_state["_zip_names"])
 
-# Gentle guidance if URL provided but no data parsed
+# If parsing failed
 if (remote_url or uploaded_csv or custom_path) and df_raw.empty:
     st.sidebar.error(
-        "Data could not be parsed. If this is a ZIP, open the 'ZIP contents' expander and pick the CSV. "
-        "If columns look merged, the file may use a rare separator or encoding."
-    )
-
-if not df_raw.empty and df_raw.shape[1] == 1:
-    st.sidebar.warning(
-        "Data loaded as a single column. The parser tried multiple separators and encodings. "
-        "If it still looks wrong, provide a ZIP with a clean CSV or adjust the CSV delimiter."
+        "Data could not be parsed. If this is a ZIP, select the CSV in 'CSV inside ZIP'. "
+        "If it still fails, keep 'Load only first N rows' checked (memory-safe)."
     )
 
 # =========================
@@ -286,7 +270,7 @@ def preprocess(df):
             df = df[m].copy()
         df['Nature'] = df['Nature'].replace('Données définitives', 'Definitive data')
 
-    # Normalize Date-Time (remove timezone suffix if present)
+    # Normalize Date-Time
     if 'Date-Time' in df.columns:
         dt_str = df['Date-Time'].astype(str)
         dt_str = np.where(pd.Series(dt_str).str.match(r'.*\+\d{2}:\d{2}$', na=False),
@@ -303,9 +287,7 @@ def preprocess(df):
         df['Weekday'] = df['Date'].dt.day_name()
     if 'Date-Time' in df.columns and df['Date-Time'].notna().any():
         df['Hour'] = df['Date-Time'].dt.hour
-        # String YearMonth to avoid Period dtype
-        if 'YearMonth' not in df.columns:
-            df['YearMonth'] = df['Date-Time'].dt.strftime('%Y-%m')
+        df['YearMonth'] = df['Date-Time'].dt.strftime('%Y-%m')
 
     # Numeric coercion
     for c in MAIN_SOURCES + ['Consumption','Physical_exchanges','Pumped_storage']:
@@ -329,14 +311,11 @@ def preprocess(df):
     df = _drop_all_zero_cols(df)
     return df
 
-df = preprocess(load_data(uploaded_csv, custom_path, remote_url, csv_inside_zip))
+df = preprocess(df_raw)
 
 required_any = ['Date-Time', 'Consumption']
 if not df.empty and (not set(required_any).issubset(df.columns)):
-    st.sidebar.error(
-        "The dataset loaded but required columns are missing. "
-        "Expected at least 'Date-Time' and 'Consumption'."
-    )
+    st.sidebar.error("Loaded dataset is missing required columns: 'Date-Time' and 'Consumption'.")
 
 if df.empty:
     st.info("No data loaded yet. Upload a CSV/ZIP, paste a direct Remote URL (CSV/ZIP), or enter a valid local path.")
@@ -388,7 +367,6 @@ if page == pages[0] and not df.empty:
 # =========================
 if page == pages[1] and not df.empty and set(required_any).issubset(df.columns):
     st.write("### DataVizualization")
-
     try:
         convert_to_mwh = st.checkbox("Convert MW (half-hourly) to MWh (×0.5) for energy totals", value=False)
         if convert_to_mwh:
@@ -408,7 +386,7 @@ if page == pages[1] and not df.empty and set(required_any).issubset(df.columns):
             if chosen_regions:
                 df_plot = df_plot[df_plot['Region'].astype(str).isin(chosen_regions)]
 
-        # Ensure calendar fields
+        # Calendar fields
         if 'Date-Time' in df_plot.columns:
             if 'Month' not in df_plot.columns:
                 df_plot['Month'] = pd.to_datetime(df_plot['Date-Time'], errors='coerce').dt.month
