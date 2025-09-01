@@ -1,6 +1,6 @@
 import os, io, base64, zipfile, re
 
-# Headless-safe Matplotlib backend (required on Streamlit Cloud)
+# Headless-safe Matplotlib backend (needed on Streamlit Cloud)
 import matplotlib
 matplotlib.use("Agg")
 
@@ -26,42 +26,51 @@ page = st.sidebar.radio("Go to", pages)
 # Data loading helpers
 # =========================
 SEPARATORS = [",", ";", "\t", "|"]
+ENCODINGS = ["utf-8", "latin-1", "cp1252"]
 
-def _try_read_csv(bio_or_path, sep):
+def _try_read_csv(bio_or_path, sep, encoding):
     try:
         return pd.read_csv(
             bio_or_path,
             sep=sep,
+            encoding=encoding,
             low_memory=False,
             on_bad_lines="skip",
-            engine="python"
+            engine="python",
         )
     except Exception:
         return None
 
-def _read_csv_try_seps_from_bytes(buf_bytes):
-    bio = io.BytesIO(buf_bytes)
+def _read_csv_try_seps_enc_from_bytes(buf_bytes):
+    """
+    Try multiple encodings and separators; pick the one with most columns.
+    """
     best = None
-    for s in SEPARATORS:
-        bio.seek(0)
-        df = _try_read_csv(bio, s)
-        if df is None:
-            continue
-        if best is None or df.shape[1] > best.shape[1]:
-            best = df
-        if df.shape[1] >= 5:
-            break
+    best_cols = -1
+    for enc in ENCODINGS:
+        for sep in SEPARATORS:
+            bio = io.BytesIO(buf_bytes)
+            df = _try_read_csv(bio, sep, enc)
+            if df is None:
+                continue
+            cols = df.shape[1]
+            if cols > best_cols:
+                best = df
+                best_cols = cols
+            if cols >= 5:
+                # early stop if looks reasonable
+                pass
     return best if best is not None else pd.DataFrame()
 
 def _normalize_url(url: str) -> str:
     u = url.strip()
-    # Dropbox: convert sharing page → direct file
+    # Dropbox share → direct
     if "dropbox.com" in u and "dl.dropboxusercontent.com" not in u:
         u = u.replace("www.dropbox.com", "dl.dropboxusercontent.com")
         u = re.sub(r"\?dl=0($|&)", "?dl=1\\1", u)
         if "dl=1" not in u:
             u += ("&" if "?" in u else "?") + "dl=1"
-    # Google Drive: file link -> export download
+    # Google Drive link → direct export
     m = re.search(r"drive.google.com/(?:file/d/|open\?id=)([^/?&]+)", u)
     if m:
         file_id = m.group(1)
@@ -77,7 +86,7 @@ def _fetch_url_bytes(url: str):
     try:
         fixed = _normalize_url(url)
         headers = {"User-Agent": "Mozilla/5.0 (Streamlit-DataLoader)"}
-        r = requests.get(fixed, headers=headers, timeout=120, allow_redirects=True)
+        r = requests.get(fixed, headers=headers, timeout=180, allow_redirects=True)
         meta["status"] = r.status_code
         meta["content_type"] = r.headers.get("content-type", "")
         meta["length"] = r.headers.get("content-length", None)
@@ -90,79 +99,77 @@ def _fetch_url_bytes(url: str):
         meta["error"] = str(e)
         return False, None, meta
 
-def _parse_bytes_to_df(raw: bytes, url_hint: str = "") -> pd.DataFrame:
-    """Try ZIP first, then CSV."""
+def _read_from_zip_bytes(raw_zip: bytes, csv_choice: str | None = None) -> pd.DataFrame:
+    """
+    List CSVs and load chosen one; if not chosen, pick the first CSV.
+    """
+    with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
+        names = zf.namelist()
+        # Store names to sidebar for selection
+        st.session_state["_zip_names"] = names
+        csvs = [n for n in names if n.lower().endswith(".csv")]
+        if not csvs:
+            return pd.DataFrame()
+        target = csv_choice or csvs[0]
+        if target not in names:
+            # if user-picked name is not present anymore, fall back
+            target = csvs[0]
+        data = zf.read(target)
+        return _read_csv_try_seps_enc_from_bytes(data)
+
+def _parse_bytes_to_df(raw: bytes, url_hint: str = "", csv_choice: str | None = None) -> pd.DataFrame:
     if not raw:
         return pd.DataFrame()
 
-    # Try ZIP (by header or extension)
     is_zip_ext = url_hint.lower().endswith(".zip")
     looks_like_zip = raw.startswith(b"PK\x03\x04")
+
     if is_zip_ext or looks_like_zip:
         try:
-            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                if not csvs:
-                    return pd.DataFrame()
-                # pick the first CSV (you can rename so the intended one is first)
-                data = zf.read(csvs[0])
-                return _read_csv_try_seps_from_bytes(data)
+            return _read_from_zip_bytes(raw, csv_choice=csv_choice)
         except Exception:
-            pass  # fall through to CSV attempt
+            pass  # fall through and try CSV
 
-    # Try CSV regardless of content-type (some hosts mislabel)
-    try:
-        return _read_csv_try_seps_from_bytes(raw)
-    except Exception:
-        return pd.DataFrame()
+    # try CSV regardless of headers
+    return _read_csv_try_seps_enc_from_bytes(raw)
 
-def _read_csv_smart(uploaded_file=None, path=None, url=None):
-    # 1) Uploaded file (CSV/ZIP)
+def _read_local_path(path: str, csv_choice: str | None = None) -> pd.DataFrame:
+    pl = path.lower()
+    if pl.endswith(".zip"):
+        with open(path, "rb") as f:
+            return _read_from_zip_bytes(f.read(), csv_choice=csv_choice)
+    with open(path, "rb") as f:
+        return _read_csv_try_seps_enc_from_bytes(f.read())
+
+def _read_uploaded(uploaded_file, csv_choice: str | None = None) -> pd.DataFrame:
+    name = (uploaded_file.name or "").lower()
+    raw = uploaded_file.read() or b""
+    if name.endswith(".zip") or raw.startswith(b"PK\x03\x04"):
+        return _read_from_zip_bytes(raw, csv_choice=csv_choice)
+    return _read_csv_try_seps_enc_from_bytes(raw)
+
+def _read_csv_smart(uploaded_file=None, path=None, url=None, csv_choice: str | None = None):
+    # Uploaded
     if uploaded_file is not None:
-        name = (uploaded_file.name or "").lower()
-        raw = uploaded_file.read() or b""
-        if name.endswith(".zip"):
-            try:
-                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-                    csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                    if not csvs:
-                        return pd.DataFrame()
-                    data = zf.read(csvs[0])
-                    return _read_csv_try_seps_from_bytes(data)
-            except Exception:
-                return pd.DataFrame()
-        # assume CSV otherwise
-        return _read_csv_try_seps_from_bytes(raw)
-
-    # 2) Remote URL (CSV/ZIP)
+        return _read_uploaded(uploaded_file, csv_choice=csv_choice)
+    # Remote
     if url:
         ok, raw, meta = _fetch_url_bytes(url)
-        st.session_state["_last_fetch_meta"] = meta  # store for sidebar debug
+        st.session_state["_last_fetch_meta"] = meta
         if not ok or raw is None:
             return pd.DataFrame()
-        return _parse_bytes_to_df(raw, url_hint=meta.get("final_url") or url)
-
-    # 3) Local path (CSV/ZIP)
+        return _parse_bytes_to_df(raw, url_hint=meta.get("final_url") or url, csv_choice=csv_choice)
+    # Local path
     if path and os.path.exists(path):
         try:
-            pl = path.lower()
-            if pl.endswith(".zip"):
-                with zipfile.ZipFile(path) as zf:
-                    csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-                    if not csvs:
-                        return pd.DataFrame()
-                    data = zf.read(csvs[0])
-                    return _read_csv_try_seps_from_bytes(data)
-            with open(path, "rb") as f:
-                return _read_csv_try_seps_from_bytes(f.read())
+            return _read_local_path(path, csv_choice=csv_choice)
         except Exception:
             return pd.DataFrame()
-
     return pd.DataFrame()
 
-@st.cache_data
-def load_data(uploaded_file=None, path=None, url=None):
-    return _read_csv_smart(uploaded_file, path, url)
+@st.cache_data(show_spinner=False)
+def load_data(uploaded_file=None, path=None, url=None, csv_choice: str | None = None):
+    return _read_csv_smart(uploaded_file, path, url, csv_choice)
 
 # =========================
 # Sidebar data source
@@ -186,7 +193,21 @@ try:
 except Exception:
     pass
 
-df_raw = load_data(uploaded_csv, custom_path, remote_url)
+# If last fetch was a ZIP, offer a chooser for CSV entry
+zip_names = st.session_state.get("_zip_names") or []
+csv_inside_zip = None
+if remote_url or uploaded_csv or (custom_path and os.path.exists(custom_path)):
+    if zip_names:
+        csv_candidates = [n for n in zip_names if n.lower().endswith(".csv")]
+        if csv_candidates:
+            csv_inside_zip = st.sidebar.selectbox(
+                "If ZIP has multiple CSVs, choose one",
+                options=csv_candidates,
+                index=0,
+                help="Pick the CSV to load from inside the ZIP archive."
+            )
+
+df_raw = load_data(uploaded_csv, custom_path, remote_url, csv_inside_zip)
 
 # Debug panel for last fetch (only if URL used)
 if remote_url:
@@ -196,18 +217,21 @@ if remote_url:
             st.write({k: v for k, v in meta.items() if v is not None})
         else:
             st.write("No fetch attempted or cached.")
+    if st.session_state.get("_zip_names"):
+        with st.sidebar.expander("ZIP contents", expanded=False):
+            st.write(st.session_state["_zip_names"])
 
 # Gentle guidance if URL provided but no data parsed
-if remote_url and df_raw.empty:
+if (remote_url or uploaded_csv or custom_path) and df_raw.empty:
     st.sidebar.error(
-        "Could not load data from the provided URL. "
-        "Make sure it downloads a .csv or .zip directly (no HTML page)."
+        "Data could not be parsed. If this is a ZIP, open the 'ZIP contents' expander and pick the CSV. "
+        "If columns look merged, the file may use a rare separator or encoding."
     )
 
 if not df_raw.empty and df_raw.shape[1] == 1:
     st.sidebar.warning(
-        "Data loaded as a single column. The parser tried ',', ';', tab, and '|'. "
-        "If columns still look wrong, provide a ZIP containing a clean CSV."
+        "Data loaded as a single column. The parser tried multiple separators and encodings. "
+        "If it still looks wrong, provide a ZIP with a clean CSV or adjust the CSV delimiter."
     )
 
 # =========================
@@ -262,7 +286,7 @@ def preprocess(df):
             df = df[m].copy()
         df['Nature'] = df['Nature'].replace('Données définitives', 'Definitive data')
 
-    # Normalize Date-Time (remove timezone suffix if any)
+    # Normalize Date-Time (remove timezone suffix if present)
     if 'Date-Time' in df.columns:
         dt_str = df['Date-Time'].astype(str)
         dt_str = np.where(pd.Series(dt_str).str.match(r'.*\+\d{2}:\d{2}$', na=False),
@@ -279,7 +303,7 @@ def preprocess(df):
         df['Weekday'] = df['Date'].dt.day_name()
     if 'Date-Time' in df.columns and df['Date-Time'].notna().any():
         df['Hour'] = df['Date-Time'].dt.hour
-        # Use string YearMonth to avoid Period dtype issues
+        # String YearMonth to avoid Period dtype
         if 'YearMonth' not in df.columns:
             df['YearMonth'] = df['Date-Time'].dt.strftime('%Y-%m')
 
@@ -305,7 +329,7 @@ def preprocess(df):
     df = _drop_all_zero_cols(df)
     return df
 
-df = preprocess(df_raw)
+df = preprocess(load_data(uploaded_csv, custom_path, remote_url, csv_inside_zip))
 
 required_any = ['Date-Time', 'Consumption']
 if not df.empty and (not set(required_any).issubset(df.columns)):
